@@ -5,7 +5,7 @@ use crate::errors::{AppError, Result};
 use crate::util::sanitize_filename;
 
 const VIDEO_EXTENSIONS: &[&str] = &["mkv", "mp4", "webm", "avi", "mov", "m4v", "ts"];
-const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "ass", "ssa", "vtt"];
+const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "ass", "ssa", "vtt", "json"];
 
 #[derive(Debug, Clone)]
 pub struct Episode {

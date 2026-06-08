@@ -1,6 +1,7 @@
 mod ass;
 mod context;
 mod filter;
+mod json_transcript;
 mod srt;
 
 pub use context::build_context;
@@ -31,31 +32,7 @@ pub fn load_and_prepare(config: &BuildConfig, source: &SubtitleSource) -> Result
         }
     };
 
-    let text = decode_text(&bytes, ext_hint.as_deref())?;
-    let mut cues = if looks_like_ass(&text) {
-        ass::parse(&text)?
-    } else {
-        srt::parse(&text)?
-    };
-
-    if !config.no_filter {
-        let regex = config
-            .regex_filter
-            .as_ref()
-            .map(|r| regex::Regex::new(r))
-            .transpose()
-            .map_err(|e| AppError::SubtitleParse(format!("invalid regex: {e}")))?;
-        cues.retain(|c| filter::is_dialogue(&c.text, regex.as_ref()));
-    }
-
-    apply_padding(&mut cues, config.padding_ms);
-
-    if config.merge_threshold_ms > 0 {
-        cues = merge_cues(cues, config.merge_threshold_ms);
-    }
-
-    assign_indices_and_context(&mut cues, config.context_lines);
-    Ok(cues)
+    prepare_cues(config, &bytes, ext_hint.as_deref())
 }
 
 pub fn load_from_bytes(
@@ -63,11 +40,24 @@ pub fn load_from_bytes(
     bytes: &[u8],
     ext_hint: Option<&str>,
 ) -> Result<Vec<Cue>> {
-    let text = decode_text(bytes, ext_hint)?;
-    let mut cues = if looks_like_ass(&text) {
-        ass::parse(&text)?
+    prepare_cues(config, bytes, ext_hint)
+}
+
+fn prepare_cues(
+    config: &BuildConfig,
+    bytes: &[u8],
+    ext_hint: Option<&str>,
+) -> Result<Vec<Cue>> {
+    let is_json = is_json_subtitle(ext_hint, bytes);
+    let mut cues = if is_json {
+        json_transcript::parse(config, bytes)?
     } else {
-        srt::parse(&text)?
+        let text = decode_text(bytes, ext_hint)?;
+        if looks_like_ass(&text) {
+            ass::parse(&text)?
+        } else {
+            srt::parse(&text)?
+        }
     };
 
     if !config.no_filter {
@@ -81,11 +71,31 @@ pub fn load_from_bytes(
     }
 
     apply_padding(&mut cues, config.padding_ms);
-    if config.merge_threshold_ms > 0 {
+
+    // JSON transcripts are pre-segmented (sentence-level or gap-based); don't re-merge.
+    if !is_json && config.merge_threshold_ms > 0 {
         cues = merge_cues(cues, config.merge_threshold_ms);
     }
+
     assign_indices_and_context(&mut cues, config.context_lines);
     Ok(cues)
+}
+
+fn is_json_subtitle(ext_hint: Option<&str>, bytes: &[u8]) -> bool {
+    if ext_hint.is_some_and(|ext| ext.eq_ignore_ascii_case("json")) {
+        return true;
+    }
+    let trimmed = bytes.iter().position(|b| !b.is_ascii_whitespace()).and_then(|i| {
+        let slice = &bytes[i..];
+        if slice.first() == Some(&b'{') {
+            std::str::from_utf8(slice)
+                .ok()
+                .map(|s| s.contains("\"words\""))
+        } else {
+            None
+        }
+    });
+    trimmed.unwrap_or(false)
 }
 
 fn assign_indices_and_context(cues: &mut [Cue], context_lines: usize) {

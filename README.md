@@ -44,6 +44,18 @@ content2srs build \
   -o episode.db
 ```
 
+### Build from an AI transcript JSON (ElevenLabs Scribe)
+
+Japanese transcripts use UniDic (via Lindera) for sentence-level cues, matching subs2cia's SRS export. Non-Japanese JSON uses gap-based segmentation (`--merge-threshold`).
+
+```bash
+content2srs build \
+  -i episode.mkv \
+  -s transcript.json \
+  --lang jpn \
+  -o episode.db
+```
+
 ### Build bundle and export .apkg in one step
 
 ```bash
@@ -62,7 +74,7 @@ content2srs export -i episode.db -o episode.apkg
 
 ### Batch build a season (one combined deck)
 
-Globs are supported. Sidecar `.srt`/`.ass` files are matched by filename stem (Plex-style language suffixes like `.ja.srt` are stripped). Embedded subtitles are used when no sidecar exists.
+Globs are supported. Sidecar `.srt`/`.ass`/`.json` files are matched by filename stem (Plex-style language suffixes like `.ja.srt` are stripped). Embedded subtitles are used when no sidecar exists.
 
 ```bash
 content2srs build \
