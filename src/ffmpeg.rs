@@ -12,8 +12,12 @@ pub struct AudioStreamInfo {
 }
 
 impl AudioStreamInfo {
+    pub fn frame_bytes(&self) -> u64 {
+        self.channels as u64 * 2
+    }
+
     pub fn bytes_per_second(&self) -> u64 {
-        self.sample_rate as u64 * self.channels as u64 * 2
+        self.sample_rate as u64 * self.frame_bytes()
     }
 
     pub fn bytes_to_ms(&self, bytes: u64) -> u64 {
@@ -21,9 +25,18 @@ impl AudioStreamInfo {
         bytes.saturating_mul(1000) / bps
     }
 
+    /// Floor to whole PCM frames so slice boundaries stay sample-aligned.
     pub fn ms_to_bytes(&self, ms: u64) -> u64 {
-        let bps = self.bytes_per_second();
-        ms.saturating_mul(bps) / 1000
+        let frame = self.frame_bytes();
+        let raw = ms.saturating_mul(self.bytes_per_second()) / 1000;
+        (raw / frame) * frame
+    }
+
+    /// Ceil to whole PCM frames (for exclusive end positions).
+    pub fn ms_to_bytes_ceil(&self, ms: u64) -> u64 {
+        let frame = self.frame_bytes();
+        let raw = ms.saturating_mul(self.bytes_per_second()) / 1000;
+        raw.div_ceil(frame) * frame
     }
 }
 
@@ -186,6 +199,28 @@ pub struct ProbeStream {
     pub channels: Option<u32>,
     pub tags: Option<serde_json::Map<String, serde_json::Value>>,
     pub disposition: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[cfg(test)]
+mod audio_stream_tests {
+    use super::AudioStreamInfo;
+
+    fn stereo_44k() -> AudioStreamInfo {
+        AudioStreamInfo {
+            stream_index: 0,
+            sample_rate: 44_100,
+            channels: 2,
+        }
+    }
+
+    #[test]
+    fn ms_to_bytes_is_frame_aligned() {
+        let info = stereo_44k();
+        for ms in [0, 1, 75, 633, 6489] {
+            assert_eq!(info.ms_to_bytes(ms) % info.frame_bytes(), 0);
+            assert_eq!(info.ms_to_bytes_ceil(ms) % info.frame_bytes(), 0);
+        }
+    }
 }
 
 impl ProbeStream {

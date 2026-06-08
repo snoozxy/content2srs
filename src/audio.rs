@@ -135,7 +135,8 @@ fn decode_pcm_jobs(
     });
 
     let mut buffer: Vec<u8> = Vec::new();
-    let mut buffer_start_ms: u64 = 0;
+    // Absolute byte offset in the decoded PCM stream (always frame-aligned).
+    let mut buffer_start_byte: u64 = 0;
     let mut read_buf = [0u8; READ_CHUNK];
     let mut jobs = Vec::with_capacity(ranges.len());
     let mut completed_ends: Vec<u64> = Vec::new();
@@ -149,7 +150,8 @@ fn decode_pcm_jobs(
         }
         buffer.extend_from_slice(&read_buf[..n]);
 
-        let position_ms = buffer_start_ms + info.bytes_to_ms(buffer.len() as u64);
+        let stream_end_byte = buffer_start_byte + buffer.len() as u64;
+        let position_ms = info.bytes_to_ms(stream_end_byte);
 
         let ready_ends: Vec<u64> = by_end
             .range(..=position_ms)
@@ -159,7 +161,7 @@ fn decode_pcm_jobs(
         for end_ms in ready_ends {
             if let Some(batch) = by_end.remove(&end_ms) {
                 for (id, start_ms, end_ms) in batch {
-                    let pcm = slice_pcm(&buffer, buffer_start_ms, start_ms, end_ms, info);
+                    let pcm = slice_pcm(&buffer, buffer_start_byte, start_ms, end_ms, info);
                     jobs.push((id, pcm));
                 }
                 completed_ends.push(end_ms);
@@ -167,7 +169,7 @@ fn decode_pcm_jobs(
         }
 
         if let Some(trim_to) = completed_ends.last().copied() {
-            trim_buffer(&mut buffer, &mut buffer_start_ms, trim_to, info);
+            trim_buffer(&mut buffer, &mut buffer_start_byte, trim_to, info);
             completed_ends.clear();
         }
     }
@@ -188,7 +190,7 @@ fn decode_pcm_jobs(
     // Flush any cues whose end lies at/near EOF.
     for (_, batch) in by_end {
         for (id, start_ms, end_ms) in batch {
-            let pcm = slice_pcm(&buffer, buffer_start_ms, start_ms, end_ms, info);
+            let pcm = slice_pcm(&buffer, buffer_start_byte, start_ms, end_ms, info);
             jobs.push((id, pcm));
         }
     }
@@ -198,40 +200,48 @@ fn decode_pcm_jobs(
 
 fn trim_buffer(
     buffer: &mut Vec<u8>,
-    buffer_start_ms: &mut u64,
+    buffer_start_byte: &mut u64,
     trim_to_ms: u64,
     info: &AudioStreamInfo,
 ) {
-    if trim_to_ms <= *buffer_start_ms {
+    let trim_abs = info.ms_to_bytes(trim_to_ms);
+    if trim_abs <= *buffer_start_byte {
         return;
     }
-    let drop_bytes = info.ms_to_bytes(trim_to_ms.saturating_sub(*buffer_start_ms)) as usize;
+    let drop_bytes = (trim_abs - *buffer_start_byte) as usize;
     if drop_bytes >= buffer.len() {
         buffer.clear();
     } else {
         buffer.drain(..drop_bytes);
     }
-    *buffer_start_ms = trim_to_ms;
+    *buffer_start_byte = trim_abs;
 }
 
 fn slice_pcm(
     buffer: &[u8],
-    buffer_start_ms: u64,
+    buffer_start_byte: u64,
     start_ms: u64,
     end_ms: u64,
     info: &AudioStreamInfo,
 ) -> Vec<u8> {
-    if buffer.is_empty() || end_ms <= buffer_start_ms {
+    if buffer.is_empty() {
         return Vec::new();
     }
-    let start_byte = info.ms_to_bytes(start_ms.saturating_sub(buffer_start_ms)) as usize;
-    let end_byte = info
-        .ms_to_bytes(end_ms.saturating_sub(buffer_start_ms))
-        .min(buffer.len() as u64) as usize;
-    if start_byte >= buffer.len() || start_byte >= end_byte {
+    let abs_start = info.ms_to_bytes(start_ms);
+    let abs_end = info.ms_to_bytes_ceil(end_ms);
+    if abs_end <= abs_start {
         return Vec::new();
     }
-    buffer[start_byte..end_byte].to_vec()
+    let stream_end = buffer_start_byte + buffer.len() as u64;
+    if abs_start >= stream_end {
+        return Vec::new();
+    }
+    let rel_start = abs_start.saturating_sub(buffer_start_byte) as usize;
+    let rel_end = abs_end.min(stream_end).saturating_sub(buffer_start_byte) as usize;
+    if rel_start >= buffer.len() || rel_start >= rel_end {
+        return Vec::new();
+    }
+    buffer[rel_start..rel_end].to_vec()
 }
 
 fn encode_pcm(
@@ -296,7 +306,9 @@ fn encode_pcm(
     let stdin_handle = thread::spawn(move || -> Result<()> {
         stdin
             .write_all(&pcm_owned)
-            .map_err(|e| AppError::Ffmpeg(e.to_string()))
+            .map_err(|e| AppError::Ffmpeg(e.to_string()))?;
+        // EOF tells ffmpeg the PCM stream is complete.
+        Ok(())
     });
     let stdout_handle = thread::spawn(move || {
         let mut buf = Vec::new();
@@ -309,13 +321,13 @@ fn encode_pcm(
         buf
     });
 
-    let status = child.wait().map_err(|e| AppError::Ffmpeg(e.to_string()))?;
     stdin_handle
         .join()
         .map_err(|_| AppError::Ffmpeg("stdin writer thread panicked".into()))??;
     let stdout = stdout_handle
         .join()
         .map_err(|_| AppError::Ffmpeg("stdout reader thread panicked".into()))?;
+    let status = child.wait().map_err(|e| AppError::Ffmpeg(e.to_string()))?;
     let stderr = stderr_handle
         .join()
         .map_err(|_| AppError::Ffmpeg("stderr reader thread panicked".into()))?;
@@ -327,4 +339,33 @@ fn encode_pcm(
         )));
     }
     Ok(stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ffmpeg::AudioStreamInfo;
+
+    fn stereo_44k() -> AudioStreamInfo {
+        AudioStreamInfo {
+            stream_index: 0,
+            sample_rate: 44_100,
+            channels: 2,
+        }
+    }
+
+    #[test]
+    fn slice_pcm_stays_frame_aligned() {
+        let info = stereo_44k();
+        let frame = info.frame_bytes() as usize;
+        // 100ms of silence-ish PCM at 44.1k stereo
+        let bytes_per_100ms = info.ms_to_bytes(100) as usize;
+        let buffer: Vec<u8> = (0..bytes_per_100ms * 10)
+            .map(|i| (i % 256) as u8)
+            .collect();
+
+        let pcm = slice_pcm(&buffer, 0, 100, 250, &info);
+        assert!(!pcm.is_empty());
+        assert_eq!(pcm.len() % frame, 0);
+    }
 }
