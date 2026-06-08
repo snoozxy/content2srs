@@ -37,6 +37,65 @@ pub enum Command {
     Build(BuildConfig),
     /// Export an existing bundle to .apkg
     Export(ExportConfig),
+    /// Manage episode / deck translation briefings
+    Summary {
+        #[command(subcommand)]
+        command: SummaryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SummaryCommand {
+    /// Set an episode briefing for a source (video filename or id)
+    Set(SetSummaryConfig),
+    /// Set a deck-wide default briefing
+    SetDeck(SetDeckSummaryConfig),
+    /// Import briefings from a JSON file
+    Import(ImportSummariesConfig),
+    /// List registered sources and briefing status
+    List(ListSummariesConfig),
+}
+
+#[derive(Debug, Parser)]
+pub struct SetSummaryConfig {
+    #[arg(short = 'i', long = "bundle", required = true)]
+    pub bundle: PathBuf,
+
+    /// Source id — usually the episode video filename (matches cards.source)
+    #[arg(short = 's', long = "source", required = true)]
+    pub source: String,
+
+    #[arg(short = 'l', long = "label")]
+    pub label: Option<String>,
+
+    /// Briefing text, or `-` to read from stdin
+    #[arg(required = true)]
+    pub text: String,
+}
+
+#[derive(Debug, Parser)]
+pub struct SetDeckSummaryConfig {
+    #[arg(short = 'i', long = "bundle", required = true)]
+    pub bundle: PathBuf,
+
+    /// Briefing text, or `-` to read from stdin
+    #[arg(required = true)]
+    pub text: String,
+}
+
+#[derive(Debug, Parser)]
+pub struct ImportSummariesConfig {
+    #[arg(short = 'i', long = "bundle", required = true)]
+    pub bundle: PathBuf,
+
+    #[arg(short = 'f', long = "file", required = true)]
+    pub file: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+pub struct ListSummariesConfig {
+    #[arg(short = 'i', long = "bundle", required = true)]
+    pub bundle: PathBuf,
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -149,6 +208,10 @@ pub struct BuildConfig {
     /// Deck / note type name for apkg export
     #[arg(long, default_value = "content2srs")]
     pub deck_name: String,
+
+    /// Import episode/deck briefings from JSON after build (see `summary import`)
+    #[arg(long = "summaries")]
+    pub summaries: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]

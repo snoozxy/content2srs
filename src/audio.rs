@@ -191,6 +191,7 @@ mod tests {
             no_audio: false,
             no_screenshot: false,
             deck_name: "test".into(),
+            summaries: None,
         }
     }
 

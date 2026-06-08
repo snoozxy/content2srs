@@ -1,0 +1,7 @@
+{
+  "deck_summary": "Optional deck-wide translation briefing used when an episode has no entry.",
+  "sources": {
+    "ep01.mkv": "This is a line from Example Show (例), episode 1. Key terms: こんにちは (hello).",
+    "ep02.mkv": "Episode 2 briefing..."
+  }
+}

@@ -111,9 +111,48 @@ In batch mode, card IDs are namespaced per episode (`ep01_card_00001`, …) and 
 
 The `.db` file is SQLite with:
 
-- `cards` — text, timestamps, context, source, audio/image BLOBs
+- `cards` — text, timestamps, line context, source, audio/image BLOBs
+- `sources` — per-episode translation briefings (keyed by `cards.source`, usually the video filename)
+- `deck_summary` — optional deck-wide default briefing
 - `assets` — original subtitle file
 - `meta` — build metadata
+
+Line context (neighbor subtitle lines) stays on each card. Episode briefings live separately and are composed into the Anki **Context** field at export time (`Episode summary: … | …`), matching the old `prepend_summary.py` workflow without mutating card rows.
+
+### Episode summaries
+
+JSON format (`summaries.example.json` in `tests/fixtures/`):
+
+```json
+{
+  "deck_summary": "Optional default for the whole deck",
+  "sources": {
+    "ep01.mkv": "Translation briefing for episode 1…",
+    "ep02.mkv": "Episode 2 briefing…"
+  }
+}
+```
+
+Import during build or anytime after:
+
+```bash
+# After build
+content2srs summary import -i show.db -f summaries.json
+
+# Or inline with build
+content2srs build -i ep.mkv -s ep.json --summaries summaries.json -o show.db
+
+# Set one episode (use `-` for stdin)
+content2srs summary set -i show.db -s ep01.mkv "Briefing text…"
+
+# Deck-wide default
+content2srs summary set-deck -i show.db "Show-level briefing…"
+
+# List sources
+content2srs summary list -i show.db
+```
+
+Re-export `.apkg` after updating briefings — no rebuild required.
 
 Share the bundle to hand off all card data and media in one file. Re-export `.apkg` anytime without re-decoding video.
 

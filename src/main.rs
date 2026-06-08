@@ -3,7 +3,7 @@ use clap::Parser;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
-use content2srs::config::{Cli, Command};
+use content2srs::config::{Cli, Command, SummaryCommand};
 use content2srs::ffmpeg::FfmpegTools;
 use content2srs::pipeline;
 
@@ -23,6 +23,12 @@ fn main() -> Result<()> {
         Command::Export(config) => {
             pipeline::run_export(&config.input, &config.output, &config.deck_name)?;
         }
+        Command::Summary { command } => match command {
+            SummaryCommand::Set(config) => pipeline::run_summary_set(&config)?,
+            SummaryCommand::SetDeck(config) => pipeline::run_summary_set_deck(&config)?,
+            SummaryCommand::Import(config) => pipeline::run_summary_import(&config)?,
+            SummaryCommand::List(config) => pipeline::run_summary_list(&config)?,
+        },
     }
 
     Ok(())

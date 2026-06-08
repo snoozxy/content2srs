@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, params};
@@ -8,7 +9,20 @@ use crate::errors::{AppError, Result};
 use crate::jobplan::CardJob;
 use crate::util::{format_timestamp_range, image_filename, media_filename, sanitize_filename};
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
+
+#[derive(Debug, Clone, Default)]
+pub struct SourceInfo {
+    pub id: String,
+    pub label: Option<String>,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SummaryIndex {
+    pub deck_summary: Option<String>,
+    pub by_source: HashMap<String, String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct CardRecord {
@@ -55,6 +69,7 @@ impl Bundle {
         if create {
             bundle.init_schema()?;
         }
+        bundle.migrate_schema()?;
         Ok(bundle)
     }
 
@@ -90,11 +105,138 @@ impl Bundle {
                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
                 CREATE INDEX IF NOT EXISTS idx_cards_cue ON cards(cue_index);
+                CREATE TABLE IF NOT EXISTS sources (
+                    id TEXT PRIMARY KEY,
+                    label TEXT,
+                    summary TEXT,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS deck_summary (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    summary TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
                 "#,
             )
             .map_err(|e| AppError::Bundle(e.to_string()))?;
         self.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
         Ok(())
+    }
+
+    fn migrate_schema(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS sources (
+                    id TEXT PRIMARY KEY,
+                    label TEXT,
+                    summary TEXT,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS deck_summary (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    summary TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                "#,
+            )
+            .map_err(|e| AppError::Bundle(e.to_string()))?;
+        self.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
+        Ok(())
+    }
+
+    pub fn register_source(&self, id: &str, label: Option<&str>) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO sources(id, label) VALUES(?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                    label=COALESCE(excluded.label, sources.label),
+                    updated_at=datetime('now')",
+                params![id, label],
+            )
+            .map_err(|e| AppError::Bundle(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn set_source_summary(
+        &self,
+        id: &str,
+        label: Option<&str>,
+        summary: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO sources(id, label, summary, updated_at)
+                 VALUES(?1, ?2, ?3, datetime('now'))
+                 ON CONFLICT(id) DO UPDATE SET
+                    label=COALESCE(excluded.label, sources.label),
+                    summary=excluded.summary,
+                    updated_at=datetime('now')",
+                params![id, label, summary],
+            )
+            .map_err(|e| AppError::Bundle(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn set_deck_summary(&self, summary: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO deck_summary(id, summary, updated_at)
+                 VALUES(1, ?1, datetime('now'))
+                 ON CONFLICT(id) DO UPDATE SET
+                    summary=excluded.summary,
+                    updated_at=datetime('now')",
+                params![summary],
+            )
+            .map_err(|e| AppError::Bundle(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_deck_summary(&self) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT summary FROM deck_summary WHERE id = 1")
+            .map_err(|e| AppError::Bundle(e.to_string()))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| AppError::Bundle(e.to_string()))?;
+        if let Some(row) = rows.next().map_err(|e| AppError::Bundle(e.to_string()))? {
+            Ok(Some(row.get(0).map_err(|e| AppError::Bundle(e.to_string()))?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_sources(&self) -> Result<Vec<SourceInfo>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, label, summary FROM sources ORDER BY id")
+            .map_err(|e| AppError::Bundle(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(SourceInfo {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    summary: row.get(2)?,
+                })
+            })
+            .map_err(|e| AppError::Bundle(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| AppError::Bundle(e.to_string()))
+    }
+
+    pub fn load_summary_index(&self) -> Result<SummaryIndex> {
+        let deck_summary = self.get_deck_summary()?;
+        let mut by_source = HashMap::new();
+        for source in self.list_sources()? {
+            if let Some(summary) = source.summary.filter(|s| !s.trim().is_empty()) {
+                by_source.insert(source.id.clone(), summary);
+            }
+        }
+        Ok(SummaryIndex {
+            deck_summary,
+            by_source,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -167,6 +309,12 @@ impl Bundle {
             .unchecked_transaction()
             .map_err(|e| AppError::Bundle(e.to_string()))?;
         for record in records {
+            tx.execute(
+                "INSERT INTO sources(id, label) VALUES(?1, ?1)
+                 ON CONFLICT(id) DO NOTHING",
+                params![record.source],
+            )
+            .map_err(|e| AppError::Bundle(e.to_string()))?;
             tx.execute(
                 "INSERT INTO cards(
                     id, cue_index, text, start_ms, end_ms, context, source,

@@ -7,8 +7,9 @@ use rusqlite::Connection;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
-use crate::bundle::{Bundle, CardRecord};
+use crate::bundle::{Bundle, CardRecord, SummaryIndex};
 use crate::errors::{AppError, Result};
+use crate::summary;
 
 /// Default deck config JSON matching genanki exports.
 const GENANKI_DCONF: &str = r#"{
@@ -54,10 +55,11 @@ pub fn export_apkg(bundle: &Bundle, output: &Path, deck_name: &str) -> Result<()
     if cards.is_empty() {
         return Err(AppError::Apkg("bundle contains no complete cards".into()));
     }
+    let summaries = bundle.load_summary_index()?;
 
     let tmp_dir = tempfile::tempdir().map_err(|e| AppError::Apkg(e.to_string()))?;
     let collection_path = tmp_dir.path().join("collection.anki2");
-    build_collection_db(&collection_path, &cards, deck_name)?;
+    build_collection_db(&collection_path, &cards, deck_name, &summaries)?;
 
     // Modern Anki expects index -> filename (see anki/importing/apkg.py), not filename -> index.
     let mut seen_names: HashMap<String, usize> = HashMap::new();
@@ -151,7 +153,12 @@ fn note_guid(card_id: &str) -> String {
     out
 }
 
-fn build_collection_db(path: &Path, cards: &[CardRecord], deck_name: &str) -> Result<()> {
+fn build_collection_db(
+    path: &Path,
+    cards: &[CardRecord],
+    deck_name: &str,
+    summaries: &SummaryIndex,
+) -> Result<()> {
     if path.exists() {
         std::fs::remove_file(path).ok();
     }
@@ -341,11 +348,16 @@ fn build_collection_db(path: &Path, cards: &[CardRecord], deck_name: &str) -> Re
             _ => String::new(),
         };
 
+        let context = summary::format_card_context(
+            &card.context,
+            summaries.by_source.get(&card.source).map(|s| s.as_str()),
+            summaries.deck_summary.as_deref(),
+        );
         let flds = [
             audio_field.as_str(),
             image_field.as_str(),
             card.text.as_str(),
-            card.context.as_str(),
+            context.as_str(),
         ]
         .join("\x1f");
 
@@ -459,6 +471,38 @@ mod tests {
             serde_json::from_reader(archive.by_name("media").unwrap()).unwrap();
         assert_eq!(media.get("0"), Some(&"a.mp3".to_string()));
         assert_eq!(media.get("1"), Some(&"b.jpg".to_string()));
+    }
+
+    #[test]
+    fn exports_episode_summary_in_context_field() {
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("test.db");
+        let bundle = Bundle::open(&bundle_path, true).unwrap();
+        bundle.commit_card(&card_record()).unwrap();
+        bundle
+            .set_source_summary("test.mkv", None, "Briefing for the episode.")
+            .unwrap();
+
+        let apkg_path = dir.path().join("deck.apkg");
+        export_apkg(&bundle, &apkg_path, "test").unwrap();
+
+        let file = std::fs::File::open(&apkg_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut db_bytes = Vec::new();
+        std::io::copy(
+            &mut archive.by_name("collection.anki2").unwrap(),
+            &mut db_bytes,
+        )
+        .unwrap();
+
+        let db_file = dir.path().join("col.anki2");
+        std::fs::write(&db_file, &db_bytes).unwrap();
+        let conn = Connection::open(&db_file).unwrap();
+        let flds: String = conn
+            .query_row("SELECT flds FROM notes", [], |r| r.get(0))
+            .unwrap();
+        assert!(flds.contains("Episode summary: Briefing for the episode."));
+        assert!(flds.contains("prev"));
     }
 
     #[test]

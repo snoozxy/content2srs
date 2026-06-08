@@ -9,7 +9,10 @@ use crate::apkg;
 use crate::audio;
 use crate::batch::{self, Episode};
 use crate::bundle::{self, Bundle};
-use crate::config::{AudioFormat, BuildConfig, ImageFormat};
+use crate::config::{
+    AudioFormat, BuildConfig, ImageFormat, ImportSummariesConfig, ListSummariesConfig,
+    SetDeckSummaryConfig, SetSummaryConfig,
+};
 use crate::errors::{AppError, Result};
 use crate::ffmpeg::FfmpegTools;
 use crate::frames::{self, FRAME_BATCH};
@@ -558,8 +561,93 @@ fn finish_build(
         }
     }
 
+    maybe_import_summaries(bundle, config)?;
     maybe_export_apkg(bundle, config)?;
     Ok(summary.clone())
+}
+
+fn maybe_import_summaries(bundle: &Bundle, config: &BuildConfig) -> Result<()> {
+    let Some(path) = &config.summaries else {
+        return Ok(());
+    };
+    let file = crate::summary::SummariesFile::from_path(path)?;
+    let stats = file.import_into(bundle)?;
+    info!(
+        "imported briefings from {} (deck={}, {} sources)",
+        path.display(),
+        if stats.deck { "yes" } else { "no" },
+        stats.sources
+    );
+    Ok(())
+}
+
+pub fn run_summary_set(config: &SetSummaryConfig) -> Result<()> {
+    let text = read_summary_text(&config.text)?;
+    let bundle = Bundle::open(&config.bundle, false)?;
+    bundle.set_source_summary(&config.source, config.label.as_deref(), &text)?;
+    info!(
+        "set briefing for source '{}' in {}",
+        config.source,
+        config.bundle.display()
+    );
+    Ok(())
+}
+
+pub fn run_summary_set_deck(config: &SetDeckSummaryConfig) -> Result<()> {
+    let text = read_summary_text(&config.text)?;
+    let bundle = Bundle::open(&config.bundle, false)?;
+    bundle.set_deck_summary(&text)?;
+    info!("set deck briefing in {}", config.bundle.display());
+    Ok(())
+}
+
+pub fn run_summary_import(config: &ImportSummariesConfig) -> Result<()> {
+    let bundle = Bundle::open(&config.bundle, false)?;
+    let file = crate::summary::SummariesFile::from_path(&config.file)?;
+    let stats = file.import_into(&bundle)?;
+    info!(
+        "imported briefings into {} (deck={}, {} sources)",
+        config.bundle.display(),
+        if stats.deck { "yes" } else { "no" },
+        stats.sources
+    );
+    Ok(())
+}
+
+pub fn run_summary_list(config: &ListSummariesConfig) -> Result<()> {
+    let bundle = Bundle::open(&config.bundle, false)?;
+    if let Some(deck) = bundle.get_deck_summary()? {
+        println!("deck: {deck}");
+    } else {
+        println!("deck: (none)");
+    }
+    for source in bundle.list_sources()? {
+        let status = if source
+            .summary
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            "set"
+        } else {
+            "empty"
+        };
+        let label = source.label.as_deref().unwrap_or("");
+        println!("{} [{status}] {label}", source.id);
+    }
+    Ok(())
+}
+
+fn read_summary_text(arg: &str) -> Result<String> {
+    if arg == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| AppError::Config(e.to_string()))?;
+        Ok(buf.trim().to_string())
+    } else {
+        Ok(arg.to_string())
+    }
 }
 
 pub fn run_export(bundle_path: &Path, output: &Path, deck_name: &str) -> Result<()> {

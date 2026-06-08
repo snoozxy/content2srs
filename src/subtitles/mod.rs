@@ -217,6 +217,7 @@ mod tests {
             no_audio: false,
             no_screenshot: false,
             deck_name: "test".into(),
+            summaries: None,
         };
         let cues = load_from_bytes(&config, srt_data, Some("srt")).unwrap();
         assert_eq!(cues.len(), 1);

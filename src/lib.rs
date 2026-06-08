@@ -11,5 +11,6 @@ pub mod jobplan;
 pub mod pipeline;
 pub mod pool;
 pub mod probe;
+pub mod summary;
 pub mod subtitles;
 pub mod util;
