@@ -34,12 +34,32 @@ fn ms_to_hms(ms: u64) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
 }
 
-pub fn media_filename(card_id: &str, start_ms: u64, end_ms: u64, ext: &str) -> String {
-    sanitize_filename(&format!("{card_id}_{start_ms}-{end_ms}.{ext}"))
+pub fn source_stem(source: &str) -> String {
+    Path::new(source)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(sanitize_filename)
+        .unwrap_or_else(|| "clip".into())
 }
 
-pub fn image_filename(card_id: &str, timestamp_ms: u64, ext: &str) -> String {
-    sanitize_filename(&format!("{card_id}_{timestamp_ms}.{ext}"))
+/// Card id prefixed with the source video stem when not already present (batch mode).
+fn media_id_part(source: &str, card_id: &str) -> String {
+    let stem = source_stem(source);
+    if card_id.starts_with(&format!("{stem}_")) {
+        card_id.to_string()
+    } else {
+        format!("{stem}_{card_id}")
+    }
+}
+
+pub fn media_filename(source: &str, card_id: &str, start_ms: u64, end_ms: u64, ext: &str) -> String {
+    let id_part = media_id_part(source, card_id);
+    sanitize_filename(&format!("{id_part}_{start_ms}-{end_ms}.{ext}"))
+}
+
+pub fn image_filename(source: &str, card_id: &str, timestamp_ms: u64, ext: &str) -> String {
+    let id_part = media_id_part(source, card_id);
+    sanitize_filename(&format!("{id_part}_{timestamp_ms}.{ext}"))
 }
 
 pub fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
@@ -61,5 +81,21 @@ mod tests {
     #[test]
     fn sanitizes_anki_illegal_chars() {
         assert_eq!(sanitize_filename("bad[name].mp3"), "bad_name_.mp3");
+    }
+
+    #[test]
+    fn media_filename_uses_source_stem() {
+        assert_eq!(
+            media_filename("show_01.mkv", "card_00042", 1000, 2000, "mp3"),
+            "show_01_card_00042_1000-2000.mp3"
+        );
+    }
+
+    #[test]
+    fn media_filename_avoids_duplicate_batch_prefix() {
+        assert_eq!(
+            media_filename("ep01.mkv", "ep01_card_00042", 1000, 2000, "mp3"),
+            "ep01_card_00042_1000-2000.mp3"
+        );
     }
 }

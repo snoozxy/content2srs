@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use crate::config::BuildConfig;
 use crate::errors::{AppError, Result};
 use crate::jobplan::CardJob;
-use crate::util::{format_timestamp_range, image_filename, media_filename, sanitize_filename};
+use crate::util::{format_timestamp_range, image_filename, media_filename};
 
 const SCHEMA_VERSION: i32 = 2;
 
@@ -436,10 +436,10 @@ pub fn build_card_record(
     image: Option<Vec<u8>>,
 ) -> CardRecord {
     let audio_filename = audio.as_ref().map(|_| {
-        sanitize_filename(&media_filename(&job.card_id, job.start_ms, job.end_ms, audio_ext))
+        media_filename(source, &job.card_id, job.start_ms, job.end_ms, audio_ext)
     });
     let image_filename = image.as_ref().map(|_| {
-        sanitize_filename(&image_filename(&job.card_id, job.screenshot_ms, image_ext))
+        image_filename(source, &job.card_id, job.screenshot_ms, image_ext)
     });
     CardRecord {
         id: job.card_id.clone(),
