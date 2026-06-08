@@ -164,6 +164,8 @@ mod tests {
     fn test_config(video: PathBuf) -> BuildConfig {
         BuildConfig {
             inputs: vec![video],
+            batch: false,
+            jobs: None,
             subtitle: None,
             output: None,
             apkg: None,

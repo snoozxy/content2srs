@@ -18,16 +18,31 @@ pub struct JobPlan {
 
 impl JobPlan {
     pub fn from_cues(cues: &[Cue], screenshot_offset_ms: u64) -> Self {
+        Self::from_cues_with_options(cues, screenshot_offset_ms, None, 0)
+    }
+
+    pub fn from_cues_with_options(
+        cues: &[Cue],
+        screenshot_offset_ms: u64,
+        id_prefix: Option<&str>,
+        cue_index_offset: usize,
+    ) -> Self {
         let cards = cues
             .iter()
-            .map(|cue| CardJob {
-                card_id: format!("card_{:05}", cue.index),
-                cue_index: cue.index,
-                start_ms: cue.start_ms,
-                end_ms: cue.end_ms,
-                screenshot_ms: cue.start_ms.saturating_add(screenshot_offset_ms),
-                text: cue.text.clone(),
-                context: cue.context.clone(),
+            .map(|cue| {
+                let card_id = match id_prefix {
+                    Some(prefix) => format!("{prefix}_card_{:05}", cue.index),
+                    None => format!("card_{:05}", cue.index),
+                };
+                CardJob {
+                    card_id,
+                    cue_index: cue_index_offset + cue.index,
+                    start_ms: cue.start_ms,
+                    end_ms: cue.end_ms,
+                    screenshot_ms: cue.start_ms.saturating_add(screenshot_offset_ms),
+                    text: cue.text.clone(),
+                    context: cue.context.clone(),
+                }
             })
             .collect();
         Self { cards }

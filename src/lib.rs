@@ -1,5 +1,6 @@
 pub mod apkg;
 pub mod audio;
+pub mod batch;
 pub mod bundle;
 pub mod config;
 pub mod errors;

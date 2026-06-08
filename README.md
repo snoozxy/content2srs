@@ -8,9 +8,10 @@ Older tools like subs2cia spawn ~2 ffmpeg subprocesses per subtitle line (audio 
 
 content2srs instead:
 
-- **Decodes audio once** (single ffmpeg pass to PCM), slices in memory, parallel MP3 encode
-- **GPU-accelerated screenshots** (`d3d11va` / `cuda` auto-detected on Windows)
-- **Bounded parallelism** (`--workers`, default min(cpu, 8)) — no ffmpeg process storm
+- **Per-clip ffmpeg audio** (one short decode per cue, same approach as subs2cia)
+- **Parallel seeked screenshots** with **GPU decode** (`d3d11va` / `cuda` auto-detected on Windows)
+- **Bounded parallelism** (`--workers`, default min(cpu, 8)) — no unbounded ffmpeg storm
+- **Season batch mode** (`--batch -j 4`) — N episodes in parallel → one combined `.db` + `.apkg`
 - **Incremental commits** every 96 cards (resumable mid-build)
 - Stores everything in one `.db` bundle (cards + media BLOBs + original subtitles)
 - Exports a ready-to-import `.apkg` without re-encoding media
@@ -59,6 +60,22 @@ content2srs build \
 content2srs export -i episode.db -o episode.apkg
 ```
 
+### Batch build a season (one combined deck)
+
+Globs are supported. Sidecar `.srt`/`.ass` files are matched by filename stem (Plex-style language suffixes like `.ja.srt` are stripped). Embedded subtitles are used when no sidecar exists.
+
+```bash
+content2srs build \
+  -i "season/*.mkv" \
+  --batch -j 4 \
+  -o "show_name.db" \
+  --apkg "show_name.apkg" \
+  --deck-name "Show Name" \
+  --lang jpn
+```
+
+In batch mode, card IDs are namespaced per episode (`ep01_card_00001`, …) and `cue_index` is global across the season for stable apkg ordering. `--workers` is split across parallel episodes (`workers / jobs` per episode).
+
 ## Common options
 
 | Flag | Description |
@@ -72,6 +89,9 @@ content2srs export -i episode.db -o episode.apkg
 | `--exact-frame` | Exact screenshot frame (slower) |
 | `--hwaccel` | Video decode: `auto` (default), `none`, `d3d11va`, `cuda` |
 | `--workers` | Parallel encode / screenshot batches (default: min(cpu, 8)) |
+| `-b, --batch` | Group inputs into episodes → one combined deck |
+| `-j, --jobs` | Episodes in parallel (batch mode; env `CONTENT2SRS_JOBS`) |
+| `--deck-name` | Anki deck name (also default output stem in batch mode) |
 | `--no-audio` / `--no-screenshot` | Skip media types |
 | `--dry-run` | Plan only, no extraction |
 

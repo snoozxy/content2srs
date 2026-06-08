@@ -180,6 +180,8 @@ mod tests {
         let srt_data = b"1\n00:00:01,000 --> 00:00:03,000\nHello world\n\n";
         let config = BuildConfig {
             inputs: vec![],
+            batch: false,
+            jobs: None,
             subtitle: None,
             output: None,
             apkg: None,

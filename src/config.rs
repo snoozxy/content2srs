@@ -41,11 +41,19 @@ pub enum Command {
 
 #[derive(Debug, Clone, Parser)]
 pub struct BuildConfig {
-    /// Input video/audio file(s)
+    /// Input video/audio file(s); globs supported (e.g. `episodes/*.mkv`)
     #[arg(short = 'i', long = "input", required = true)]
     pub inputs: Vec<PathBuf>,
 
-    /// External subtitle file (optional if embedded)
+    /// Batch mode: group inputs into episodes (video + sidecar sub) → one combined deck
+    #[arg(short = 'b', long = "batch")]
+    pub batch: bool,
+
+    /// Episodes to process in parallel (batch mode). Env: CONTENT2SRS_JOBS
+    #[arg(short = 'j', long = "jobs", env = "CONTENT2SRS_JOBS")]
+    pub jobs: Option<usize>,
+
+    /// External subtitle file (optional if embedded; not used with --batch)
     #[arg(short = 's', long = "subtitle")]
     pub subtitle: Option<PathBuf>,
 
@@ -162,6 +170,16 @@ impl BuildConfig {
         if let Some(out) = &self.output {
             return out.clone();
         }
+        if self.batch {
+            let name = crate::util::sanitize_filename(&self.deck_name);
+            return self
+                .inputs
+                .first()
+                .and_then(|p| p.parent())
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(|d| d.join(format!("{name}.db")))
+                .unwrap_or_else(|| PathBuf::from(format!("{name}.db")));
+        }
         let stem = self
             .inputs
             .first()
@@ -173,5 +191,21 @@ impl BuildConfig {
             .and_then(|p| p.parent())
             .map(|d| d.join(format!("{stem}.db")))
             .unwrap_or_else(|| PathBuf::from(format!("{stem}.db")))
+    }
+
+    pub fn for_episode(
+        &self,
+        video: std::path::PathBuf,
+        subtitle: Option<std::path::PathBuf>,
+        workers: usize,
+    ) -> Self {
+        Self {
+            inputs: vec![video],
+            subtitle,
+            workers,
+            batch: false,
+            jobs: None,
+            ..self.clone()
+        }
     }
 }
