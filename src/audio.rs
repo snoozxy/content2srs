@@ -279,21 +279,52 @@ fn encode_pcm(
         .spawn()
         .map_err(|e| AppError::Ffmpeg(e.to_string()))?;
 
-    if let Some(mut stdin) = child.stdin.take() {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| AppError::Ffmpeg("no ffmpeg stdin".into()))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::Ffmpeg("no ffmpeg stdout".into()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AppError::Ffmpeg("no ffmpeg stderr".into()))?;
+
+    let pcm_owned = pcm.to_vec();
+    let stdin_handle = thread::spawn(move || -> Result<()> {
         stdin
-            .write_all(pcm)
-            .map_err(|e| AppError::Ffmpeg(e.to_string()))?;
-    }
+            .write_all(&pcm_owned)
+            .map_err(|e| AppError::Ffmpeg(e.to_string()))
+    });
+    let stdout_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| AppError::Ffmpeg(e.to_string()))?;
+    let status = child.wait().map_err(|e| AppError::Ffmpeg(e.to_string()))?;
+    stdin_handle
+        .join()
+        .map_err(|_| AppError::Ffmpeg("stdin writer thread panicked".into()))??;
+    let stdout = stdout_handle
+        .join()
+        .map_err(|_| AppError::Ffmpeg("stdout reader thread panicked".into()))?;
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| AppError::Ffmpeg("stderr reader thread panicked".into()))?;
 
-    if !output.status.success() {
+    if !status.success() {
         return Err(AppError::Ffmpeg(format!(
             "pcm encode failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&stderr)
         )));
     }
-    Ok(output.stdout)
+    Ok(stdout)
 }
