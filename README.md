@@ -8,10 +8,12 @@ Older tools like subs2cia spawn ~2 ffmpeg subprocesses per subtitle line (audio 
 
 content2srs instead:
 
-- Batches media extraction (~32 cards per ffmpeg invocation)
+- **Decodes audio once** (single ffmpeg pass to PCM), slices in memory, parallel MP3 encode
+- **GPU-accelerated screenshots** (`d3d11va` / `cuda` auto-detected on Windows)
+- **Bounded parallelism** (`--workers`, default min(cpu, 8)) — no ffmpeg process storm
+- **Incremental commits** every 96 cards (resumable mid-build)
 - Stores everything in one `.db` bundle (cards + media BLOBs + original subtitles)
 - Exports a ready-to-import `.apkg` without re-encoding media
-- Supports transactional resume (re-runs skip completed cards)
 
 ## Requirements
 
@@ -68,7 +70,8 @@ content2srs export -i episode.db -o episode.apkg
 | `--no-filter` | Include signs/songs (disable dialogue filter) |
 | `-R, --regex` | Exclude lines matching regex |
 | `--exact-frame` | Exact screenshot frame (slower) |
-| `--hwaccel` | Hardware decode (e.g. `d3d11va`, `cuda`) |
+| `--hwaccel` | Video decode: `auto` (default), `none`, `d3d11va`, `cuda` |
+| `--workers` | Parallel encode / screenshot batches (default: min(cpu, 8)) |
 | `--no-audio` / `--no-screenshot` | Skip media types |
 | `--dry-run` | Plan only, no extraction |
 

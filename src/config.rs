@@ -2,6 +2,10 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+fn pool_default_workers() -> usize {
+    crate::pool::default_workers()
+}
+
 #[derive(Debug, Clone, ValueEnum)]
 pub enum AudioFormat {
     Mp3,
@@ -110,9 +114,13 @@ pub struct BuildConfig {
     #[arg(long)]
     pub exact_frame: bool,
 
-    /// Hardware decode acceleration (cuda, d3d11va, etc.)
-    #[arg(long)]
-    pub hwaccel: Option<String>,
+    /// Hardware video decode: auto, none, d3d11va, cuda, etc.
+    #[arg(long, default_value = "auto")]
+    pub hwaccel: String,
+
+    /// Parallel ffmpeg / encode workers (default: min(cpu_count, 8))
+    #[arg(long, default_value_t = pool_default_workers())]
+    pub workers: usize,
 
     /// Resume an interrupted build (default: true)
     #[arg(long, default_value_t = true)]

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use tracing::{info, warn};
@@ -8,7 +9,8 @@ use crate::bundle::{self, Bundle};
 use crate::config::{AudioFormat, BuildConfig, ImageFormat};
 use crate::errors::Result;
 use crate::ffmpeg::FfmpegTools;
-use crate::frames;
+use crate::frames::{self, FRAME_BATCH};
+use crate::hwaccel;
 use crate::jobplan::JobPlan;
 use crate::probe::{self, SubtitleSource};
 use crate::subtitles::{self, subtitle_filename};
@@ -33,7 +35,11 @@ pub fn run_build(ffmpeg: &FfmpegTools, config: &BuildConfig) -> Result<BuildSumm
 
     let subtitle_bytes = match &sources.subtitle {
         SubtitleSource::External { path, bytes } => {
-            (bytes.clone(), subtitle_filename(path), path.extension().and_then(|e| e.to_str()).map(String::from))
+            (
+                bytes.clone(),
+                subtitle_filename(path),
+                path.extension().and_then(|e| e.to_str()).map(String::from),
+            )
         }
         SubtitleSource::Embedded {
             container,
@@ -104,96 +110,119 @@ pub fn run_build(ffmpeg: &FfmpegTools, config: &BuildConfig) -> Result<BuildSumm
         ImageFormat::Webp => "webp",
     };
 
-    let mut audio_map = std::collections::HashMap::new();
-    let mut image_map = std::collections::HashMap::new();
+    let mut audio_map: HashMap<String, Result<Vec<u8>>> = HashMap::new();
 
     if !config.no_audio {
         let ranges: Vec<_> = pending
             .iter()
             .map(|j| (j.card_id.clone(), j.start_ms, j.end_ms))
             .collect();
-        info!("extracting {} audio clips in batches", ranges.len());
-        let results = audio::extract_audio_clips(
+        for (id, result) in audio::extract_audio_clips(
             ffmpeg,
             &sources.audio.path,
             sources.audio.stream_index,
             &ranges,
             config,
-        );
-        for (id, result) in results {
+        ) {
             audio_map.insert(id, result);
         }
     }
 
-    if !config.no_screenshot {
-        if let Some(video) = &sources.video {
-            let timestamps: Vec<_> = pending
-                .iter()
-                .map(|j| (j.card_id.clone(), j.screenshot_ms))
-                .collect();
-            info!("extracting {} screenshots in batches", timestamps.len());
-            let results = frames::extract_frames(
-                ffmpeg,
-                &video.path,
-                video.stream_index,
-                &timestamps,
-                config,
-            );
-            for (id, result) in results {
-                image_map.insert(id, result);
+    let hwaccel = hwaccel::resolve_hwaccel(ffmpeg, Some(config.hwaccel.as_str()));
+    let video = sources.video.as_ref();
+    let batch_count = pending.len().div_ceil(FRAME_BATCH);
+
+    for (batch_idx, chunk) in pending.chunks(FRAME_BATCH).enumerate() {
+        let mut image_map: HashMap<String, Result<Vec<u8>>> = HashMap::new();
+
+        if !config.no_screenshot {
+            if let Some(video) = video {
+                let timestamps: Vec<_> = chunk
+                    .iter()
+                    .map(|j| (j.card_id.clone(), j.screenshot_ms))
+                    .collect();
+                info!(
+                    "screenshot batch {}/{} ({} cards)",
+                    batch_idx + 1,
+                    batch_count,
+                    chunk.len()
+                );
+                match frames::extract_batch(
+                    ffmpeg,
+                    &video.path,
+                    video.stream_index,
+                    &timestamps,
+                    config,
+                    hwaccel.as_deref(),
+                ) {
+                    Ok(results) => {
+                        for (id, result) in results {
+                            image_map.insert(id, result);
+                        }
+                    }
+                    Err(e) => {
+                        for job in chunk {
+                            summary.failed += 1;
+                            summary.failures.push((job.card_id.clone(), e.to_string()));
+                            bundle.mark_card_failed(job, &source_label, &e.to_string())?;
+                        }
+                        continue;
+                    }
+                }
+            } else if batch_idx == 0 {
+                warn!("no video stream found; skipping screenshots");
             }
-        } else {
-            warn!("no video stream found; skipping screenshots");
         }
-    }
 
-    for job in &pending {
-        let audio = if config.no_audio {
-            None
-        } else {
-            match audio_map.remove(&job.card_id) {
-                Some(Ok(bytes)) => Some(bytes),
-                Some(Err(e)) => {
-                    summary.failed += 1;
-                    summary.failures.push((job.card_id.clone(), e.to_string()));
-                    bundle.mark_card_failed(job, &source_label, &e.to_string())?;
-                    continue;
+        for job in chunk {
+            let audio = if config.no_audio {
+                None
+            } else {
+                match audio_map.get(&job.card_id).cloned() {
+                    Some(Ok(bytes)) => Some(bytes),
+                    Some(Err(e)) => {
+                        summary.failed += 1;
+                        summary.failures.push((job.card_id.clone(), e.to_string()));
+                        bundle.mark_card_failed(job, &source_label, &e.to_string())?;
+                        continue;
+                    }
+                    None => {
+                        summary.failed += 1;
+                        let msg = "missing audio extraction result".to_string();
+                        summary.failures.push((job.card_id.clone(), msg.clone()));
+                        bundle.mark_card_failed(job, &source_label, &msg)?;
+                        continue;
+                    }
                 }
-                None => {
-                    summary.failed += 1;
-                    let msg = "missing audio extraction result".to_string();
-                    summary.failures.push((job.card_id.clone(), msg.clone()));
-                    bundle.mark_card_failed(job, &source_label, &msg)?;
-                    continue;
-                }
-            }
-        };
+            };
 
-        let image = if config.no_screenshot {
-            None
-        } else {
-            match image_map.remove(&job.card_id) {
-                Some(Ok(bytes)) => Some(bytes),
-                Some(Err(e)) => {
-                    summary.failed += 1;
-                    summary.failures.push((job.card_id.clone(), e.to_string()));
-                    bundle.mark_card_failed(job, &source_label, &e.to_string())?;
-                    continue;
+            let image = if config.no_screenshot {
+                None
+            } else {
+                match image_map.remove(&job.card_id) {
+                    Some(Ok(bytes)) => Some(bytes),
+                    Some(Err(e)) => {
+                        summary.failed += 1;
+                        summary.failures.push((job.card_id.clone(), e.to_string()));
+                        bundle.mark_card_failed(job, &source_label, &e.to_string())?;
+                        continue;
+                    }
+                    None if video.is_some() => {
+                        summary.failed += 1;
+                        let msg = "missing screenshot extraction result".to_string();
+                        summary.failures.push((job.card_id.clone(), msg.clone()));
+                        bundle.mark_card_failed(job, &source_label, &msg)?;
+                        continue;
+                    }
+                    None => None,
                 }
-                None if sources.video.is_some() => {
-                    summary.failed += 1;
-                    let msg = "missing screenshot extraction result".to_string();
-                    summary.failures.push((job.card_id.clone(), msg.clone()));
-                    bundle.mark_card_failed(job, &source_label, &msg)?;
-                    continue;
-                }
-                None => None,
-            }
-        };
+            };
 
-        let record = bundle::build_card_record(job, &source_label, audio_ext, image_ext, audio, image);
-        bundle.commit_card(&record)?;
-        summary.committed += 1;
+            let record =
+                bundle::build_card_record(job, &source_label, audio_ext, image_ext, audio, image);
+            bundle.commit_card(&record)?;
+            summary.committed += 1;
+        }
     }
 
     info!(

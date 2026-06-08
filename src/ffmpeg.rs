@@ -5,6 +5,29 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
+pub struct AudioStreamInfo {
+    pub stream_index: usize,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+impl AudioStreamInfo {
+    pub fn bytes_per_second(&self) -> u64 {
+        self.sample_rate as u64 * self.channels as u64 * 2
+    }
+
+    pub fn bytes_to_ms(&self, bytes: u64) -> u64 {
+        let bps = self.bytes_per_second().max(1);
+        bytes.saturating_mul(1000) / bps
+    }
+
+    pub fn ms_to_bytes(&self, ms: u64) -> u64 {
+        let bps = self.bytes_per_second();
+        ms.saturating_mul(bps) / 1000
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct FfmpegTools {
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
@@ -74,6 +97,57 @@ impl FfmpegTools {
         Ok(())
     }
 
+    pub fn audio_stream_info(&self, path: &Path, stream_index: usize) -> Result<AudioStreamInfo> {
+        let probe = self.probe_json(path)?;
+        let stream = probe
+            .streams
+            .as_ref()
+            .and_then(|streams| streams.iter().find(|s| s.index.unwrap_or(0) as usize == stream_index))
+            .context("audio stream not found in probe")?;
+
+        let sample_rate = stream
+            .sample_rate
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(48_000);
+        let channels = stream
+            .channels
+            .unwrap_or(2)
+            .clamp(1, 8) as u16;
+
+        Ok(AudioStreamInfo {
+            stream_index,
+            sample_rate,
+            channels,
+        })
+    }
+
+    pub fn hwaccel_available(&self, hwaccel: &str) -> bool {
+        let output = Command::new(&self.ffmpeg)
+            .args([
+                "-hide_banner",
+                "-v",
+                "error",
+                "-hwaccel",
+                hwaccel,
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=0.1:size=64x64:rate=1",
+                "-frames:v",
+                "1",
+                "-f",
+                "null",
+                "-",
+            ])
+            .output();
+
+        match output {
+            Ok(o) => o.status.success(),
+            Err(_) => false,
+        }
+    }
+
     pub fn run_capture(&self, args: &[&str]) -> Result<Vec<u8>> {
         let output = Command::new(&self.ffmpeg)
             .args(args)
@@ -108,6 +182,8 @@ pub struct ProbeStream {
     pub index: Option<u32>,
     pub codec_type: Option<String>,
     pub codec_name: Option<String>,
+    pub sample_rate: Option<String>,
+    pub channels: Option<u32>,
     pub tags: Option<serde_json::Map<String, serde_json::Value>>,
     pub disposition: Option<serde_json::Map<String, serde_json::Value>>,
 }
