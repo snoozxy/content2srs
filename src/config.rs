@@ -39,7 +39,7 @@ pub enum Command {
     Export(ExportConfig),
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 pub struct BuildConfig {
     /// Input video/audio file(s)
     #[arg(short = 'i', long = "input", required = true)]

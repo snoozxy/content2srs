@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use rayon::prelude::*;
@@ -9,9 +10,25 @@ use crate::errors::{AppError, Result};
 use crate::ffmpeg::FfmpegTools;
 use crate::hwaccel;
 use crate::pool;
+use crate::util::ms_to_ffmpeg_time;
 
 /// Timestamps per ffmpeg select batch (keeps filter expressions under OS limits).
 pub const FRAME_BATCH: usize = 96;
+
+/// Seek this far before the earliest frame so ffmpeg lands on a nearby keyframe.
+const SEEK_MARGIN_MS: u64 = 3_000;
+
+/// Extra decode tail after the last frame window.
+const CAPTURE_TAIL_MS: u64 = 500;
+
+/// Compute input seek position and decode duration for a temporally grouped batch.
+pub fn batch_seek_range(batch: &[(String, u64)]) -> (u64, u64) {
+    let min_ms = batch.iter().map(|(_, ms)| *ms).min().unwrap_or(0);
+    let max_ms = batch.iter().map(|(_, ms)| *ms).max().unwrap_or(min_ms);
+    let seek_ms = min_ms.saturating_sub(SEEK_MARGIN_MS);
+    let duration_ms = max_ms.saturating_sub(seek_ms) + CAPTURE_TAIL_MS;
+    (seek_ms, duration_ms.max(1))
+}
 
 pub fn extract_frames(
     ffmpeg: &FfmpegTools,
@@ -26,27 +43,59 @@ pub fn extract_frames(
 
     let mut sorted: Vec<(String, u64)> = timestamps.to_vec();
     sorted.sort_by_key(|(_, t)| *t);
-    sorted.dedup_by_key(|(_, t)| *t);
 
     let hwaccel = hwaccel::resolve_hwaccel(ffmpeg, Some(config.hwaccel.as_str()));
+    let batches: Vec<Vec<(String, u64)>> = sorted.chunks(FRAME_BATCH).map(|c| c.to_vec()).collect();
 
-    info!(
-        "extracting {} screenshots in select batches (batch={}, workers={}, hwaccel={})",
-        sorted.len(),
-        FRAME_BATCH,
-        config.workers,
-        hwaccel.as_deref().unwrap_or("none")
+    let map = extract_batches_parallel(
+        ffmpeg,
+        input,
+        video_stream_index,
+        &batches,
+        config,
+        hwaccel.as_deref(),
     );
 
-    let chunks: Vec<_> = sorted.chunks(FRAME_BATCH).collect();
+    timestamps
+        .iter()
+        .map(|(id, _)| {
+            (
+                id.clone(),
+                map.get(id)
+                    .cloned()
+                    .unwrap_or_else(|| Err(AppError::Ffmpeg("missing screenshot".into()))),
+            )
+        })
+        .collect()
+}
+
+pub fn extract_batches_parallel(
+    ffmpeg: &FfmpegTools,
+    input: &Path,
+    video_stream_index: usize,
+    batches: &[Vec<(String, u64)>],
+    config: &BuildConfig,
+    hwaccel: Option<&str>,
+) -> HashMap<String, Result<Vec<u8>>> {
+    if batches.is_empty() {
+        return HashMap::new();
+    }
+
+    let frame_count: usize = batches.iter().map(|b| b.len()).sum();
+    info!(
+        "extracting {frame_count} screenshots in {} parallel batches (up to {FRAME_BATCH}/batch, {} workers, hwaccel={})",
+        batches.len(),
+        config.workers,
+        hwaccel.unwrap_or("none")
+    );
 
     pool::install_pool_with(config.workers, || {
-        chunks
+        batches
             .par_iter()
-            .flat_map(|chunk| {
-                extract_batch(ffmpeg, input, video_stream_index, chunk, config, hwaccel.as_deref())
+            .flat_map(|batch| {
+                extract_batch(ffmpeg, input, video_stream_index, batch, config, hwaccel)
                     .unwrap_or_else(|e| {
-                        chunk
+                        batch
                             .iter()
                             .map(|(id, _)| (id.clone(), Err(e.clone())))
                             .collect()
@@ -64,13 +113,19 @@ pub fn extract_batch(
     config: &BuildConfig,
     hwaccel: Option<&str>,
 ) -> Result<Vec<(String, Result<Vec<u8>>)>> {
+    if batch.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let tmp = TempDir::new().map_err(|e| AppError::Ffmpeg(e.to_string()))?;
     let input_str = input.to_str().unwrap_or_default();
+    let (seek_ms, duration_ms) = batch_seek_range(batch);
+    let seek_sec = seek_ms as f64 / 1000.0;
 
     let select_expr: String = batch
         .iter()
         .map(|(_, ms)| {
-            let t = *ms as f64 / 1000.0;
+            let t = (*ms as f64 / 1000.0) - seek_sec;
             let t2 = t + 0.05;
             format!("between(t\\,{t:.3}\\,{t2:.3})")
         })
@@ -98,6 +153,9 @@ pub fn extract_batch(
         }
     }
 
+    args.push("-ss".into());
+    args.push(ms_to_ffmpeg_time(seek_ms));
+
     if config.exact_frame {
         args.push("-i".into());
     } else {
@@ -105,6 +163,8 @@ pub fn extract_batch(
         args.push("-i".into());
     }
     args.push(input_str.into());
+    args.push("-t".into());
+    args.push(ms_to_ffmpeg_time(duration_ms));
     args.push("-vf".into());
     args.push(vf);
     args.push("-vsync".into());
@@ -130,4 +190,25 @@ pub fn extract_batch(
         results.push((id.clone(), bytes));
     }
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_seek_range_clamps_to_zero() {
+        let batch = vec![("a".into(), 500), ("b".into(), 2000)];
+        let (seek, dur) = batch_seek_range(&batch);
+        assert_eq!(seek, 0);
+        assert_eq!(dur, 2000 + CAPTURE_TAIL_MS);
+    }
+
+    #[test]
+    fn batch_seek_range_applies_margin() {
+        let batch = vec![("a".into(), 60_000), ("b".into(), 65_000)];
+        let (seek, dur) = batch_seek_range(&batch);
+        assert_eq!(seek, 60_000 - SEEK_MARGIN_MS);
+        assert_eq!(dur, 65_000 - seek + CAPTURE_TAIL_MS);
+    }
 }

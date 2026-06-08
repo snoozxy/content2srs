@@ -9,7 +9,6 @@ use zip::{CompressionMethod, ZipWriter};
 
 use crate::bundle::{Bundle, CardRecord};
 use crate::errors::{AppError, Result};
-use crate::util::atomic_write;
 
 const MODEL_ID: i64 = 1_601_739_408_287_017_736;
 const DECK_ID: i64 = 1;
@@ -48,9 +47,9 @@ pub fn export_apkg(bundle: &Bundle, output: &Path, deck_name: &str) -> Result<()
 
     let media_json = serde_json::to_string(&media_map).map_err(|e| AppError::Apkg(e.to_string()))?;
 
-    let tmp_apkg = output.with_extension("apkg.tmp");
+    let staging = output.with_extension("apkg.staging");
     {
-        let file = File::create(&tmp_apkg).map_err(|e| AppError::Apkg(e.to_string()))?;
+        let file = File::create(&staging).map_err(|e| AppError::Apkg(e.to_string()))?;
         let mut zip = ZipWriter::new(file);
         let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
 
@@ -77,9 +76,10 @@ pub fn export_apkg(bundle: &Bundle, output: &Path, deck_name: &str) -> Result<()
         zip.finish().map_err(|e| AppError::Apkg(e.to_string()))?;
     }
 
-    atomic_write(output, &std::fs::read(&tmp_apkg).map_err(|e| AppError::Apkg(e.to_string()))?)
-        .map_err(|e| AppError::Apkg(e.to_string()))?;
-    let _ = std::fs::remove_file(&tmp_apkg);
+    if output.exists() {
+        std::fs::remove_file(output).map_err(|e| AppError::Apkg(e.to_string()))?;
+    }
+    std::fs::rename(&staging, output).map_err(|e| AppError::Apkg(e.to_string()))?;
     Ok(())
 }
 

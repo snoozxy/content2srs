@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::thread;
 
 use tracing::{info, warn};
 
@@ -7,7 +8,7 @@ use crate::apkg;
 use crate::audio;
 use crate::bundle::{self, Bundle};
 use crate::config::{AudioFormat, BuildConfig, ImageFormat};
-use crate::errors::Result;
+use crate::errors::{AppError, Result};
 use crate::ffmpeg::FfmpegTools;
 use crate::frames::{self, FRAME_BATCH};
 use crate::hwaccel;
@@ -110,69 +111,103 @@ pub fn run_build(ffmpeg: &FfmpegTools, config: &BuildConfig) -> Result<BuildSumm
         ImageFormat::Webp => "webp",
     };
 
-    let mut audio_map: HashMap<String, Result<Vec<u8>>> = HashMap::new();
-
-    if !config.no_audio {
-        let ranges: Vec<_> = pending
-            .iter()
-            .map(|j| (j.card_id.clone(), j.start_ms, j.end_ms))
-            .collect();
-        for (id, result) in audio::extract_audio_clips(
-            ffmpeg,
-            &sources.audio.path,
-            sources.audio.stream_index,
-            &ranges,
-            config,
-        ) {
-            audio_map.insert(id, result);
-        }
+    let video = sources.video.as_ref();
+    if video.is_none() && !config.no_screenshot {
+        warn!("no video stream found; skipping screenshots");
     }
 
-    let hwaccel = hwaccel::resolve_hwaccel(ffmpeg, Some(config.hwaccel.as_str()));
-    let video = sources.video.as_ref();
-    let batch_count = pending.len().div_ceil(FRAME_BATCH);
-
-    for (batch_idx, chunk) in pending.chunks(FRAME_BATCH).enumerate() {
-        let mut image_map: HashMap<String, Result<Vec<u8>>> = HashMap::new();
-
-        if !config.no_screenshot {
-            if let Some(video) = video {
-                let timestamps: Vec<_> = chunk
+    let screenshot_batches: Vec<Vec<(String, u64)>> = if !config.no_screenshot && video.is_some() {
+        pending
+            .chunks(FRAME_BATCH)
+            .map(|chunk| {
+                chunk
                     .iter()
                     .map(|j| (j.card_id.clone(), j.screenshot_ms))
-                    .collect();
-                info!(
-                    "screenshot batch {}/{} ({} cards)",
-                    batch_idx + 1,
-                    batch_count,
-                    chunk.len()
-                );
-                match frames::extract_batch(
-                    ffmpeg,
-                    &video.path,
-                    video.stream_index,
-                    &timestamps,
-                    config,
-                    hwaccel.as_deref(),
-                ) {
-                    Ok(results) => {
-                        for (id, result) in results {
-                            image_map.insert(id, result);
-                        }
-                    }
-                    Err(e) => {
-                        for job in chunk {
-                            summary.failed += 1;
-                            summary.failures.push((job.card_id.clone(), e.to_string()));
-                            bundle.mark_card_failed(job, &source_label, &e.to_string())?;
-                        }
-                        continue;
-                    }
-                }
-            } else if batch_idx == 0 {
-                warn!("no video stream found; skipping screenshots");
+                    .collect()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let ffmpeg_audio = ffmpeg.clone();
+    let ffmpeg_video = ffmpeg.clone();
+    let config_audio = config.clone();
+    let config_video = config.clone();
+    let audio_path = sources.audio.path.clone();
+    let audio_stream_index = sources.audio.stream_index;
+    let audio_ranges: Vec<_> = pending
+        .iter()
+        .map(|j| (j.card_id.clone(), j.start_ms, j.end_ms))
+        .collect();
+
+    let video_path = video.map(|v| v.path.clone());
+    let video_stream_index = video.map(|v| v.stream_index).unwrap_or(0);
+    let hwaccel = hwaccel::resolve_hwaccel(ffmpeg, Some(config.hwaccel.as_str()));
+    let hwaccel_label = hwaccel.clone();
+
+    let audio_handle = if config.no_audio {
+        None
+    } else {
+        Some(thread::spawn(move || {
+            let mut map = HashMap::new();
+            for (id, result) in audio::extract_audio_clips(
+                &ffmpeg_audio,
+                &audio_path,
+                audio_stream_index,
+                &audio_ranges,
+                &config_audio,
+            ) {
+                map.insert(id, result);
             }
-        }
+            map
+        }))
+    };
+
+    let screenshot_handle = if screenshot_batches.is_empty() {
+        None
+    } else {
+        let path = video_path.expect("video path required for screenshots");
+        Some(thread::spawn(move || {
+            frames::extract_batches_parallel(
+                &ffmpeg_video,
+                &path,
+                video_stream_index,
+                &screenshot_batches,
+                &config_video,
+                hwaccel.as_deref(),
+            )
+        }))
+    };
+
+    let audio_map: HashMap<String, Result<Vec<u8>>> = if let Some(handle) = audio_handle {
+        handle
+            .join()
+            .map_err(|_| AppError::Ffmpeg("audio extraction thread panicked".into()))?
+    } else {
+        HashMap::new()
+    };
+
+    let image_map: HashMap<String, Result<Vec<u8>>> = if let Some(handle) = screenshot_handle {
+        handle
+            .join()
+            .map_err(|_| AppError::Ffmpeg("screenshot extraction thread panicked".into()))?
+    } else {
+        HashMap::new()
+    };
+
+    if !config.no_screenshot && video.is_some() {
+        info!(
+            "media extraction complete (audio={}, screenshots={}, hwaccel={})",
+            if config.no_audio { "skipped" } else { "done" },
+            image_map.len(),
+            hwaccel_label.as_deref().unwrap_or("none")
+        );
+    }
+
+    let batch_count = pending.len().div_ceil(FRAME_BATCH);
+    for (batch_idx, chunk) in pending.chunks(FRAME_BATCH).enumerate() {
+        let mut records = Vec::with_capacity(chunk.len());
 
         for job in chunk {
             let audio = if config.no_audio {
@@ -198,8 +233,8 @@ pub fn run_build(ffmpeg: &FfmpegTools, config: &BuildConfig) -> Result<BuildSumm
 
             let image = if config.no_screenshot {
                 None
-            } else {
-                match image_map.remove(&job.card_id) {
+            } else if video.is_some() {
+                match image_map.get(&job.card_id).cloned() {
                     Some(Ok(bytes)) => Some(bytes),
                     Some(Err(e)) => {
                         summary.failed += 1;
@@ -207,21 +242,32 @@ pub fn run_build(ffmpeg: &FfmpegTools, config: &BuildConfig) -> Result<BuildSumm
                         bundle.mark_card_failed(job, &source_label, &e.to_string())?;
                         continue;
                     }
-                    None if video.is_some() => {
+                    None => {
                         summary.failed += 1;
                         let msg = "missing screenshot extraction result".to_string();
                         summary.failures.push((job.card_id.clone(), msg.clone()));
                         bundle.mark_card_failed(job, &source_label, &msg)?;
                         continue;
                     }
-                    None => None,
                 }
+            } else {
+                None
             };
 
-            let record =
-                bundle::build_card_record(job, &source_label, audio_ext, image_ext, audio, image);
-            bundle.commit_card(&record)?;
-            summary.committed += 1;
+            records.push(bundle::build_card_record(
+                job, &source_label, audio_ext, image_ext, audio, image,
+            ));
+        }
+
+        if !records.is_empty() {
+            info!(
+                "committing batch {}/{} ({} cards)",
+                batch_idx + 1,
+                batch_count,
+                records.len()
+            );
+            bundle.commit_cards(&records)?;
+            summary.committed += records.len();
         }
     }
 

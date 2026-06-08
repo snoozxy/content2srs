@@ -40,8 +40,14 @@ impl Bundle {
             }
         }
         let conn = Connection::open(path).map_err(|e| AppError::Bundle(e.to_string()))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-            .map_err(|e| AppError::Bundle(e.to_string()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA cache_size=-64000;
+             PRAGMA temp_store=MEMORY;
+             PRAGMA foreign_keys=ON;",
+        )
+        .map_err(|e| AppError::Bundle(e.to_string()))?;
         let bundle = Self {
             conn,
             path: path.to_path_buf(),
@@ -149,40 +155,49 @@ impl Bundle {
     }
 
     pub fn commit_card(&self, record: &CardRecord) -> Result<()> {
+        self.commit_cards(std::slice::from_ref(record))
+    }
+
+    pub fn commit_cards(&self, records: &[CardRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
         let tx = self
             .conn
             .unchecked_transaction()
             .map_err(|e| AppError::Bundle(e.to_string()))?;
-        tx.execute(
-            "INSERT INTO cards(
-                id, cue_index, text, start_ms, end_ms, context, source,
-                audio_filename, image_filename, audio_blob, image_blob,
-                audio_sha256, image_sha256, status, error
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'complete',NULL)
-            ON CONFLICT(id) DO UPDATE SET
-                text=excluded.text, start_ms=excluded.start_ms, end_ms=excluded.end_ms,
-                context=excluded.context, source=excluded.source,
-                audio_filename=excluded.audio_filename, image_filename=excluded.image_filename,
-                audio_blob=excluded.audio_blob, image_blob=excluded.image_blob,
-                audio_sha256=excluded.audio_sha256, image_sha256=excluded.image_sha256,
-                status='complete', error=NULL",
-            params![
-                record.id,
-                record.cue_index as i64,
-                record.text,
-                record.start_ms as i64,
-                record.end_ms as i64,
-                record.context,
-                record.source,
-                record.audio_filename,
-                record.image_filename,
-                record.audio_blob,
-                record.image_blob,
-                record.audio_sha256,
-                record.image_sha256,
-            ],
-        )
-        .map_err(|e| AppError::Bundle(e.to_string()))?;
+        for record in records {
+            tx.execute(
+                "INSERT INTO cards(
+                    id, cue_index, text, start_ms, end_ms, context, source,
+                    audio_filename, image_filename, audio_blob, image_blob,
+                    audio_sha256, image_sha256, status, error
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'complete',NULL)
+                ON CONFLICT(id) DO UPDATE SET
+                    text=excluded.text, start_ms=excluded.start_ms, end_ms=excluded.end_ms,
+                    context=excluded.context, source=excluded.source,
+                    audio_filename=excluded.audio_filename, image_filename=excluded.image_filename,
+                    audio_blob=excluded.audio_blob, image_blob=excluded.image_blob,
+                    audio_sha256=excluded.audio_sha256, image_sha256=excluded.image_sha256,
+                    status='complete', error=NULL",
+                params![
+                    record.id,
+                    record.cue_index as i64,
+                    record.text,
+                    record.start_ms as i64,
+                    record.end_ms as i64,
+                    record.context,
+                    record.source,
+                    record.audio_filename,
+                    record.image_filename,
+                    record.audio_blob,
+                    record.image_blob,
+                    record.audio_sha256,
+                    record.image_sha256,
+                ],
+            )
+            .map_err(|e| AppError::Bundle(e.to_string()))?;
+        }
         tx.commit().map_err(|e| AppError::Bundle(e.to_string()))?;
         Ok(())
     }
