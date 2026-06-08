@@ -1,0 +1,5 @@
+/target
+**/*.db
+**/*.apkg
+tests/fixtures/sample.mp4
+tests/fixtures/out.*
