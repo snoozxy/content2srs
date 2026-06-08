@@ -10,9 +10,44 @@ use zip::{CompressionMethod, ZipWriter};
 use crate::bundle::{Bundle, CardRecord};
 use crate::errors::{AppError, Result};
 
-const MODEL_ID: i64 = 1_601_739_408_287_017_736;
-const DECK_ID: i64 = 1;
-const NOTE_TYPE_ID: i64 = 1;
+/// Default deck config JSON matching genanki exports.
+const GENANKI_DCONF: &str = r#"{
+    "1": {
+        "autoplay": true,
+        "id": 1,
+        "lapse": {
+            "delays": [10],
+            "leechAction": 0,
+            "leechFails": 8,
+            "minInt": 1,
+            "mult": 0
+        },
+        "maxTaken": 60,
+        "mod": 0,
+        "name": "Default",
+        "new": {
+            "bury": true,
+            "delays": [1, 10],
+            "initialFactor": 2500,
+            "ints": [1, 4, 7],
+            "order": 1,
+            "perDay": 20,
+            "separate": true
+        },
+        "replayq": true,
+        "rev": {
+            "bury": true,
+            "ease4": 1.3,
+            "fuzz": 0.05,
+            "ivlFct": 1,
+            "maxIvl": 36500,
+            "minSpace": 1,
+            "perDay": 100
+        },
+        "timer": 0,
+        "usn": 0
+    }
+}"#;
 
 pub fn export_apkg(bundle: &Bundle, output: &Path, deck_name: &str) -> Result<()> {
     let cards = bundle.list_complete_cards()?;
@@ -81,6 +116,33 @@ pub fn export_apkg(bundle: &Bundle, output: &Path, deck_name: &str) -> Result<()
     }
     std::fs::rename(&staging, output).map_err(|e| AppError::Apkg(e.to_string()))?;
     Ok(())
+}
+
+/// Deterministic IDs matching `apkg_export.py` / genanki.
+fn deterministic_id(seed: &str) -> i64 {
+    let digest = md5::compute(seed.as_bytes());
+    let hex = format!("{digest:x}");
+    i64::from_str_radix(&hex[..8], 16).unwrap_or(1)
+}
+
+fn deck_id(deck_name: &str) -> i64 {
+    deterministic_id(deck_name)
+}
+
+fn model_id(deck_name: &str) -> i64 {
+    deterministic_id(&format!("{deck_name}_model"))
+}
+
+fn note_guid(card_id: &str) -> String {
+    let digest = md5::compute(card_id.as_bytes());
+    let mut out = String::with_capacity(10);
+    for byte in digest.0 {
+        out.push(char::from(b'0' + (byte % 10)));
+        if out.len() == 10 {
+            break;
+        }
+    }
+    out
 }
 
 fn build_collection_db(path: &Path, cards: &[CardRecord], deck_name: &str) -> Result<()> {
@@ -155,49 +217,75 @@ fn build_collection_db(path: &Path, cards: &[CardRecord], deck_name: &str) -> Re
     .map_err(|e| AppError::Apkg(e.to_string()))?;
 
     let now = chrono::Utc::now().timestamp();
+    let did = deck_id(deck_name);
+    let mid = model_id(deck_name);
+    let mid_key = mid.to_string();
+
+    // Match dojo-prompts/scripts/apkg_export.py (genanki Listening Card model).
     let models = serde_json::json!({
-        MODEL_ID.to_string(): {
-            "id": MODEL_ID,
-            "name": "content2srs",
+        &mid_key: {
+            "id": &mid_key,
+            "name": format!("{deck_name} Model"),
             "type": 0,
             "mod": now,
-            "usn": 0,
+            "usn": -1,
             "sortf": 0,
-            "did": DECK_ID,
+            "did": did,
+            "latexPre": "\\documentclass[12pt]{article}\n\\special{papersize=3in,5in}\n\\usepackage[utf8]{inputenc}\n\\usepackage{amssymb,amsmath}\n\\pagestyle{empty}\n\\setlength{\\parindent}{0in}\n\\begin{document}\n",
+            "latexPost": "\\end{document}",
+            "latexsvg": false,
+            "tags": [],
+            "vers": [],
             "tmpls": [{
-                "name": "Card 1",
+                "name": "Listening Card",
                 "ord": 0,
-                "qfmt": "{{Expression}}<br>{{#Image}}<img src=\"{{Image}}\">{{/Image}}<br>{{Audio}}",
-                "afmt": "{{Context}}<hr>{{Timestamps}}<br><small>{{Source}}</small>"
+                "qfmt": "{{Audio}}",
+                "afmt": "{{FrontSide}}<hr id=answer>{{Image}}<br>{{Text}}<br><br><small>{{Context}}</small>",
+                "bqfmt": "",
+                "bafmt": "",
+                "bfont": "",
+                "bsize": 0,
+                "did": null
             }],
             "flds": [
-                {"name": "Expression", "ord": 0, "sticky": false, "rtl": false, "font": "Arial", "size": 20, "media": []},
-                {"name": "Audio", "ord": 1, "sticky": false, "rtl": false, "font": "Arial", "size": 20, "media": ["audio"]},
-                {"name": "Image", "ord": 2, "sticky": false, "rtl": false, "font": "Arial", "size": 20, "media": ["image"]},
-                {"name": "Context", "ord": 3, "sticky": false, "rtl": false, "font": "Arial", "size": 20, "media": []},
-                {"name": "Timestamps", "ord": 4, "sticky": false, "rtl": false, "font": "Arial", "size": 20, "media": []},
-                {"name": "Source", "ord": 5, "sticky": false, "rtl": false, "font": "Arial", "size": 20, "media": []}
+                {"name": "Audio", "ord": 0, "sticky": false, "rtl": false, "font": "Liberation Sans", "size": 20, "media": []},
+                {"name": "Image", "ord": 1, "sticky": false, "rtl": false, "font": "Liberation Sans", "size": 20, "media": []},
+                {"name": "Text", "ord": 2, "sticky": false, "rtl": false, "font": "Liberation Sans", "size": 20, "media": []},
+                {"name": "Context", "ord": 3, "sticky": false, "rtl": false, "font": "Liberation Sans", "size": 20, "media": []}
             ],
-            "css": ".card { font-family: arial; font-size: 20px; text-align: center; }",
-            "latexPre": "",
-            "latexPost": "",
-            "latexsvg": false,
-            "req": [[0, "any", [0,1,2]]]
+            "css": ".card { font-family: sans-serif; font-size: 24px; text-align: center; }",
+            "req": [[0, "all", [0]]]
         }
     });
+
     let decks = serde_json::json!({
         "1": {
             "id": 1,
             "mod": now,
-            "name": deck_name,
+            "name": "Default",
             "usn": 0,
-            "desc": "Generated by content2srs",
+            "desc": "",
             "dyn": 0,
             "conf": 1,
             "collapsed": false,
-            "browserCollapsed": false,
+            "extendNew": 10,
+            "extendRev": 50,
+            "newToday": [0, 0],
+            "revToday": [0, 0],
+            "lrnToday": [0, 0],
+            "timeToday": [0, 0]
+        },
+        did.to_string(): {
+            "id": did,
+            "mod": now,
+            "name": deck_name,
+            "usn": -1,
+            "desc": "",
+            "dyn": 0,
+            "conf": 1,
+            "collapsed": false,
             "extendNew": 0,
-            "extendRev": 0,
+            "extendRev": 50,
             "newToday": [0, 0],
             "revToday": [0, 0],
             "lrnToday": [0, 0],
@@ -205,44 +293,69 @@ fn build_collection_db(path: &Path, cards: &[CardRecord], deck_name: &str) -> Re
         }
     });
 
+    let conf = serde_json::json!({
+        "activeDecks": [1],
+        "addToCur": true,
+        "collapseTime": 1200,
+        "curDeck": 1,
+        "curModel": mid.to_string(),
+        "dueCounts": true,
+        "estTimes": true,
+        "newBury": true,
+        "newSpread": 0,
+        "nextPos": 1,
+        "sortBackwards": false,
+        "sortType": "noteFld",
+        "timeLim": 0
+    });
+
     conn.execute(
-        "INSERT INTO col VALUES (1, ?1, ?1, ?1, 11, 0, 0, 0, '{}', ?2, ?3, '{}', '')",
-        rusqlite::params![now, models.to_string(), decks.to_string()],
+        "INSERT INTO col VALUES (1, ?1, ?1, ?1, 11, 0, 0, 0, ?2, ?3, ?4, ?5, '')",
+        rusqlite::params![
+            now,
+            conf.to_string(),
+            models.to_string(),
+            decks.to_string(),
+            GENANKI_DCONF,
+        ],
     )
     .map_err(|e| AppError::Apkg(e.to_string()))?;
 
+    let base_note_id = chrono::Utc::now().timestamp_millis();
+
     for (i, card) in cards.iter().enumerate() {
-        let note_id = (i as i64) + 1;
-        let card_id = note_id;
-        let guid = format!("c2s-{:08x}", note_id);
+        let audio_filename = match (&card.audio_filename, &card.audio_blob) {
+            (Some(name), Some(_)) => name.clone(),
+            _ => continue,
+        };
 
-        let audio_field = card
-            .audio_filename
-            .as_ref()
-            .map(|f| format!("[sound:{f}]"))
-            .unwrap_or_default();
-        let image_field = card.image_filename.clone().unwrap_or_default();
-        let timestamps = format!("{}-{}", card.start_ms, card.end_ms);
+        let audio_field = format!("[sound:{audio_filename}]");
+        let image_field = match (&card.image_filename, &card.image_blob) {
+            (Some(name), Some(_)) => format!("<img src=\"{name}\">"),
+            _ => String::new(),
+        };
 
-        let flds = vec![
-            card.text.clone(),
-            audio_field,
-            image_field,
-            card.context.clone(),
-            timestamps,
-            card.source.clone(),
+        let flds = [
+            audio_field.as_str(),
+            image_field.as_str(),
+            card.text.as_str(),
+            card.context.as_str(),
         ]
         .join("\x1f");
 
+        let note_id = base_note_id + i as i64;
+        let card_row_id = note_id + 1;
+        let guid = note_guid(&card.id);
+
         conn.execute(
-            "INSERT INTO notes VALUES (?1, ?2, ?3, ?4, 0, '', ?5, ?6, 0, 0, '')",
-            rusqlite::params![note_id, guid, NOTE_TYPE_ID, now, flds, card.text],
+            "INSERT INTO notes VALUES (?1, ?2, ?3, ?4, -1, '', ?5, ?6, 0, 0, '')",
+            rusqlite::params![note_id, guid, mid, now, flds, audio_field],
         )
         .map_err(|e| AppError::Apkg(e.to_string()))?;
 
         conn.execute(
-            "INSERT INTO cards VALUES (?1, ?2, ?3, 0, ?4, 0, 0, 0, ?2, 0, 2500, 0, 0, 0, 0, 0, 0, '')",
-            rusqlite::params![card_id, note_id, DECK_ID, now],
+            "INSERT INTO cards VALUES (?1, ?2, ?3, 0, ?4, 0, 0, 0, 0, 0, 2500, 0, 0, 0, 0, 0, 0, '')",
+            rusqlite::params![card_row_id, note_id, did, now],
         )
         .map_err(|e| AppError::Apkg(e.to_string()))?;
     }
@@ -254,30 +367,82 @@ fn build_collection_db(path: &Path, cards: &[CardRecord], deck_name: &str) -> Re
 mod tests {
     use super::*;
     use crate::bundle::{Bundle, CardRecord};
+    use rusqlite::Connection;
     use tempfile::tempdir;
+
+    fn card_record() -> CardRecord {
+        CardRecord {
+            id: "card_00000".into(),
+            cue_index: 0,
+            text: "こんにちは".into(),
+            start_ms: 1000,
+            end_ms: 2000,
+            context: "prev\nnext".into(),
+            source: "test.mkv".into(),
+            audio_filename: Some("a.mp3".into()),
+            image_filename: Some("b.jpg".into()),
+            audio_blob: Some(vec![0x01, 0x02]),
+            image_blob: Some(vec![0x03, 0x04]),
+            audio_sha256: None,
+            image_sha256: None,
+        }
+    }
+
+    #[test]
+    fn deterministic_ids_match_python() {
+        assert_eq!(deck_id("test"), 160_394_189);
+        assert_eq!(model_id("test"), 2_491_705_758);
+    }
+
+    #[test]
+    fn exports_listening_card_note_fields() {
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("test.db");
+        let bundle = Bundle::open(&bundle_path, true).unwrap();
+        bundle.commit_card(&card_record()).unwrap();
+
+        let apkg_path = dir.path().join("deck.apkg");
+        export_apkg(&bundle, &apkg_path, "test").unwrap();
+
+        let file = std::fs::File::open(&apkg_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut db_bytes = Vec::new();
+        std::io::copy(
+            &mut archive.by_name("collection.anki2").unwrap(),
+            &mut db_bytes,
+        )
+        .unwrap();
+
+        let db_file = dir.path().join("col.anki2");
+        std::fs::write(&db_file, &db_bytes).unwrap();
+        let conn = Connection::open(&db_file).unwrap();
+
+        let models: String = conn
+            .query_row("SELECT models FROM col", [], |r| r.get(0))
+            .unwrap();
+        assert!(models.contains("Listening Card"));
+        assert!(models.contains("{{Audio}}"));
+        assert!(models.contains(r#"<hr id=answer>"#));
+
+        let flds: String = conn
+            .query_row("SELECT flds FROM notes", [], |r| r.get(0))
+            .unwrap();
+        assert!(flds.contains("[sound:a.mp3]"));
+        assert!(flds.contains(r#"<img src="b.jpg">"#));
+        assert!(flds.contains("こんにちは"));
+
+        let due: i64 = conn
+            .query_row("SELECT due FROM cards", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(due, 0);
+    }
 
     #[test]
     fn exports_apkg_zip_structure() {
         let dir = tempdir().unwrap();
         let bundle_path = dir.path().join("test.db");
         let bundle = Bundle::open(&bundle_path, true).unwrap();
-        bundle
-            .commit_card(&CardRecord {
-                id: "card_00000".into(),
-                cue_index: 0,
-                text: "hello".into(),
-                start_ms: 1000,
-                end_ms: 2000,
-                context: "ctx".into(),
-                source: "test.mkv".into(),
-                audio_filename: Some("a.mp3".into()),
-                image_filename: Some("b.jpg".into()),
-                audio_blob: Some(vec![0x01, 0x02]),
-                image_blob: Some(vec![0x03, 0x04]),
-                audio_sha256: None,
-                image_sha256: None,
-            })
-            .unwrap();
+        bundle.commit_card(&card_record()).unwrap();
 
         let apkg_path = dir.path().join("deck.apkg");
         export_apkg(&bundle, &apkg_path, "test").unwrap();
