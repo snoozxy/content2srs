@@ -2,6 +2,8 @@
 
 Fast, resilient subtitle-to-Anki media engine. Turns video (+ subtitles) into a **SQLite deck bundle** (`.db`) with per-cue audio clips and screenshots as BLOBs, then exports a ready-to-import **Anki `.apkg`**.
 
+Part of the [snoozxy](https://github.com/snoozxy) immersion-learning toolchain — used by [dojo-prompts](https://github.com/snoozxy/dojo-prompts) `/process-local` and intended as a faster replacement for [subs2cia](https://github.com/snoozxy/subs2cia) `srs` deck export.
+
 ```bash
 content2srs --help
 content2srs build --help
@@ -31,9 +33,16 @@ content2srs instead:
 ## Install
 
 ```bash
+git clone https://github.com/snoozxy/content2srs.git
+cd content2srs
 cargo install --path .
-# or
+```
+
+Or build a release binary:
+
+```bash
 cargo build --release
+# → target/release/content2srs
 ```
 
 ## Quick start
@@ -75,12 +84,33 @@ content2srs build \
   --lang jpn
 ```
 
-Batch mode namespaced card IDs (`ep01_card_00001`, …), global `cue_index` for apkg ordering, and `workers / jobs` per episode.
+Batch mode uses namespaced card IDs (`ep01_card_00001`, …), a global `cue_index` for apkg ordering, and splits `workers / jobs` per episode.
 
 ### Export only
 
 ```bash
 content2srs export -i show.db -o show.apkg --deck-name "Show Name"
+```
+
+## dojo-prompts pipeline
+
+Typical local workflow (see [dojo-prompts](https://github.com/snoozxy/dojo-prompts)):
+
+1. **Transcode** — `scripts/transcode_batch.py` → 480p proxies for faster screenshots (`hw_probe.py` sets encoder/workers in `~/.dojo_hw_cache.json`)
+2. **Subtitles** — `jimaku_dl.py` / `sync_subs.py`, or ElevenLabs Scribe `.json`
+3. **Summaries** — translation briefings JSON (replaces `prepend_summary.py`)
+4. **Build** — `content2srs build` on proxies or full-res source
+5. **Import** — `.apkg` into Anki (Listening Card model)
+
+```bash
+content2srs build \
+  -i "show/480p/*.mkv" \
+  --batch -j 4 \
+  --summaries summaries.json \
+  -o show.db \
+  --apkg show.apkg \
+  --deck-name "Show Name" \
+  --lang jpn
 ```
 
 ## Commands
@@ -96,7 +126,7 @@ content2srs export -i show.db -o show.apkg --deck-name "Show Name"
 
 ### Episode summaries
 
-Translation briefings (from dojo-prompts / `prepend_summary.py` workflow) live in the bundle — not baked into card rows. At export they become the Anki **Context** field:
+Translation briefings live in the bundle — not baked into card rows. At export they become the Anki **Context** field:
 
 `Episode summary: {briefing} | {neighbor subtitle lines}`
 
@@ -184,4 +214,4 @@ Integration tests generate `tests/fixtures/sample.mp4` via ffmpeg on first run.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
