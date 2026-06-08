@@ -59,28 +59,34 @@ pub fn export_apkg(bundle: &Bundle, output: &Path, deck_name: &str) -> Result<()
     let collection_path = tmp_dir.path().join("collection.anki2");
     build_collection_db(&collection_path, &cards, deck_name)?;
 
-    let mut media_map: HashMap<String, usize> = HashMap::new();
+    // Modern Anki expects index -> filename (see anki/importing/apkg.py), not filename -> index.
+    let mut seen_names: HashMap<String, usize> = HashMap::new();
     let mut media_files: Vec<(usize, String, Vec<u8>)> = Vec::new();
     let mut next_id = 0usize;
 
     for card in &cards {
         if let (Some(name), Some(blob)) = (&card.audio_filename, &card.audio_blob) {
-            if !media_map.contains_key(name) {
-                media_map.insert(name.clone(), next_id);
+            if !seen_names.contains_key(name) {
+                seen_names.insert(name.clone(), next_id);
                 media_files.push((next_id, name.clone(), blob.clone()));
                 next_id += 1;
             }
         }
         if let (Some(name), Some(blob)) = (&card.image_filename, &card.image_blob) {
-            if !media_map.contains_key(name) {
-                media_map.insert(name.clone(), next_id);
+            if !seen_names.contains_key(name) {
+                seen_names.insert(name.clone(), next_id);
                 media_files.push((next_id, name.clone(), blob.clone()));
                 next_id += 1;
             }
         }
     }
 
-    let media_json = serde_json::to_string(&media_map).map_err(|e| AppError::Apkg(e.to_string()))?;
+    let media_json_map: HashMap<String, String> = media_files
+        .iter()
+        .map(|(id, name, _)| (id.to_string(), name.clone()))
+        .collect();
+    let media_json =
+        serde_json::to_string(&media_json_map).map_err(|e| AppError::Apkg(e.to_string()))?;
 
     let staging = output.with_extension("apkg.staging");
     {
@@ -435,6 +441,24 @@ mod tests {
             .query_row("SELECT due FROM cards", [], |r| r.get(0))
             .unwrap();
         assert_eq!(due, 0);
+    }
+
+    #[test]
+    fn media_map_uses_index_to_filename() {
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("test.db");
+        let bundle = Bundle::open(&bundle_path, true).unwrap();
+        bundle.commit_card(&card_record()).unwrap();
+
+        let apkg_path = dir.path().join("deck.apkg");
+        export_apkg(&bundle, &apkg_path, "test").unwrap();
+
+        let file = File::open(&apkg_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let media: HashMap<String, String> =
+            serde_json::from_reader(archive.by_name("media").unwrap()).unwrap();
+        assert_eq!(media.get("0"), Some(&"a.mp3".to_string()));
+        assert_eq!(media.get("1"), Some(&"b.jpg".to_string()));
     }
 
     #[test]
