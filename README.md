@@ -1,52 +1,57 @@
 # content2srs
 
-Fast, resilient subtitle-to-Anki media engine. Turns a video (+ optional separate audio) and subtitle file into a **single SQLite deck bundle** with per-line audio clips and screenshots stored as BLOBs, plus a one-pass `.apkg` exporter.
+Fast, resilient subtitle-to-Anki media engine. Turns video (+ subtitles) into a **SQLite deck bundle** (`.db`) with per-cue audio clips and screenshots as BLOBs, then exports a ready-to-import **Anki `.apkg`**.
+
+```bash
+content2srs --help
+content2srs build --help
+content2srs export --help
+content2srs summary --help
+```
 
 ## Why this exists
 
-Older tools like subs2cia spawn ~2 ffmpeg subprocesses per subtitle line (audio trim + screenshot), re-opening and re-seeking the source each time. For a season that means thousands of subprocesses and thousands of tiny media files on disk.
+Older tools like subs2cia spawn ~2 ffmpeg subprocesses per subtitle line. For a season that means thousands of subprocesses and thousands of tiny media files on disk.
 
 content2srs instead:
 
-- **Per-clip ffmpeg audio** (one short decode per cue, same approach as subs2cia)
-- **Parallel seeked screenshots** with **GPU decode** (`d3d11va` / `cuda` auto-detected on Windows)
-- **Bounded parallelism** (`--workers`, default min(cpu, 8)) — no unbounded ffmpeg storm
-- **Season batch mode** (`--batch -j 4`) — N episodes in parallel → one combined `.db` + `.apkg`
+- **Per-clip ffmpeg audio** (one short decode per cue)
+- **Parallel seeked screenshots** with **GPU decode** (`d3d11va` / `cuda` on Windows)
+- **Bounded parallelism** (`--workers`, default min(cpu, 8))
+- **Season batch mode** (`--batch -j 4`) → one combined `.db` + `.apkg`
+- **ElevenLabs Scribe `.json`** with Japanese SRS sentence segmentation (UniDic via Lindera)
+- **Episode translation briefings** stored in the bundle, applied at export
 - **Incremental commits** every 96 cards (resumable mid-build)
-- Stores everything in one `.db` bundle (cards + media BLOBs + original subtitles)
-- Exports a ready-to-import `.apkg` without re-encoding media
 
 ## Requirements
 
 - Rust 1.80+
-- `ffmpeg` and `ffprobe` on PATH
+- `ffmpeg` and `ffprobe` on PATH (or `--ffmpeg` / `CONTENT2SRS_FFMPEG`)
 
 ## Install
 
 ```bash
 cargo install --path .
-```
-
-Or build locally:
-
-```bash
+# or
 cargo build --release
 ```
 
-## Usage
+## Quick start
 
-### Build a deck bundle
+### Single episode (SRT)
 
 ```bash
 content2srs build \
   -i episode.mkv \
   -s episode.srt \
-  -o episode.db
+  -o episode.db \
+  --apkg episode.apkg \
+  --deck-name "Episode Name"
 ```
 
-### Build from an AI transcript JSON (ElevenLabs Scribe)
+### AI transcript JSON (ElevenLabs Scribe)
 
-Japanese transcripts use UniDic (via Lindera) for sentence-level cues, matching subs2cia's SRS export. Non-Japanese JSON uses gap-based segmentation (`--merge-threshold`).
+Japanese transcripts use UniDic sentence-level cues (subs2cia-compatible SRS mode). Other languages use gap-based segmentation (`--merge-threshold-ms`).
 
 ```bash
 content2srs build \
@@ -56,25 +61,9 @@ content2srs build \
   -o episode.db
 ```
 
-### Build bundle and export .apkg in one step
+### Season batch (one combined deck)
 
-```bash
-content2srs build \
-  -i episode.mkv \
-  -s episode.srt \
-  -o episode.db \
-  --apkg episode.apkg
-```
-
-### Export an existing bundle to .apkg
-
-```bash
-content2srs export -i episode.db -o episode.apkg
-```
-
-### Batch build a season (one combined deck)
-
-Globs are supported. Sidecar `.srt`/`.ass`/`.json` files are matched by filename stem (Plex-style language suffixes like `.ja.srt` are stripped). Embedded subtitles are used when no sidecar exists.
+Globs supported. Sidecar `.srt` / `.ass` / `.json` matched by filename stem (Plex-style `.ja.srt` suffixes stripped). Embedded subs used when no sidecar.
 
 ```bash
 content2srs build \
@@ -86,42 +75,30 @@ content2srs build \
   --lang jpn
 ```
 
-In batch mode, card IDs are namespaced per episode (`ep01_card_00001`, …) and `cue_index` is global across the season for stable apkg ordering. `--workers` is split across parallel episodes (`workers / jobs` per episode).
+Batch mode namespaced card IDs (`ep01_card_00001`, …), global `cue_index` for apkg ordering, and `workers / jobs` per episode.
 
-## Common options
+### Export only
 
-| Flag | Description |
-|------|-------------|
-| `-p, --padding` | Padding around each cue (ms, default 75) |
-| `-t, --merge-threshold` | Merge nearby lines (ms, default 0 = one line per card) |
-| `--lang` | Prefer audio/subtitle stream by language |
-| `--audio-index` / `--subtitle-index` / `--video-index` | Force stream indices |
-| `--no-filter` | Include signs/songs (disable dialogue filter) |
-| `-R, --regex` | Exclude lines matching regex |
-| `--exact-frame` | Exact screenshot frame (slower) |
-| `--hwaccel` | Video decode: `auto` (default), `none`, `d3d11va`, `cuda` |
-| `--workers` | Parallel encode / screenshot batches (default: min(cpu, 8)) |
-| `-b, --batch` | Group inputs into episodes → one combined deck |
-| `-j, --jobs` | Episodes in parallel (batch mode; env `CONTENT2SRS_JOBS`) |
-| `--deck-name` | Anki deck name (also default output stem in batch mode) |
-| `--no-audio` / `--no-screenshot` | Skip media types |
-| `--dry-run` | Plan only, no extraction |
+```bash
+content2srs export -i show.db -o show.apkg --deck-name "Show Name"
+```
 
-## Bundle format
+## Commands
 
-The `.db` file is SQLite with:
-
-- `cards` — text, timestamps, line context, source, audio/image BLOBs
-- `sources` — per-episode translation briefings (keyed by `cards.source`, usually the video filename)
-- `deck_summary` — optional deck-wide default briefing
-- `assets` — original subtitle file
-- `meta` — build metadata
-
-Line context (neighbor subtitle lines) stays on each card. Episode briefings live separately and are composed into the Anki **Context** field at export time (`Episode summary: … | …`), matching the old `prepend_summary.py` workflow without mutating card rows.
+| Command | Description |
+|---------|-------------|
+| `build` | Extract media → SQLite bundle |
+| `export` | Bundle → Anki `.apkg` |
+| `summary set` | Set briefing for one episode (`cards.source`) |
+| `summary set-deck` | Set deck-wide default briefing |
+| `summary import` | Import briefings from JSON |
+| `summary list` | List sources and briefing status |
 
 ### Episode summaries
 
-JSON format (`summaries.example.json` in `tests/fixtures/`):
+Translation briefings (from dojo-prompts / `prepend_summary.py` workflow) live in the bundle — not baked into card rows. At export they become the Anki **Context** field:
+
+`Episode summary: {briefing} | {neighbor subtitle lines}`
 
 ```json
 {
@@ -133,28 +110,69 @@ JSON format (`summaries.example.json` in `tests/fixtures/`):
 }
 ```
 
-Import during build or anytime after:
+See `tests/fixtures/summaries.example.json`.
 
 ```bash
-# After build
+# Import anytime (re-export .apkg after — no rebuild)
 content2srs summary import -i show.db -f summaries.json
 
-# Or inline with build
-content2srs build -i ep.mkv -s ep.json --summaries summaries.json -o show.db
+# Or during build
+content2srs build -i ep.mkv -s ep.srt --summaries summaries.json -o show.db
 
-# Set one episode (use `-` for stdin)
+# One episode (stdin with `-`)
 content2srs summary set -i show.db -s ep01.mkv "Briefing text…"
 
-# Deck-wide default
 content2srs summary set-deck -i show.db "Show-level briefing…"
 
-# List sources
 content2srs summary list -i show.db
 ```
 
-Re-export `.apkg` after updating briefings — no rebuild required.
+## Build options
 
-Share the bundle to hand off all card data and media in one file. Re-export `.apkg` anytime without re-decoding video.
+| Flag | Description |
+|------|-------------|
+| `-i, --input` | Video file(s); globs OK (`season/*.mkv`) |
+| `-s, --subtitle` | External `.srt` / `.ass` / `.json` (not with `--batch`) |
+| `-o, --output` | Output bundle path (`.db`) |
+| `--apkg` | Also export `.apkg` after build |
+| `-b, --batch` | Group inputs into episodes → one deck |
+| `-j, --jobs` | Parallel episodes (env: `CONTENT2SRS_JOBS`) |
+| `--deck-name` | Anki deck name; batch default output stem |
+| `--summaries` | Import briefings JSON after build |
+| `-p, --padding-ms` | Padding around each cue in ms (default 75) |
+| `-t, --merge-threshold-ms` | Merge nearby SRT lines in ms (default 0); JSON gap mode for non-Japanese |
+| `--context-lines` | Neighbor lines in card context (default 3) |
+| `--lang` | Prefer audio/subtitle stream; required for Japanese JSON |
+| `--audio-index` / `--subtitle-index` / `--video-index` | Force stream indices |
+| `--no-filter` | Include signs/songs |
+| `-R, --regex` | Exclude lines matching regex |
+| `--audio-format` | `mp3` (default) or `opus` |
+| `--audio-bitrate-kbps` | Audio bitrate (default 128) |
+| `--loudnorm` | Normalize audio loudness |
+| `--image-format` | `jpg` (default) or `webp` |
+| `--screenshot-offset-ms` | Screenshot offset from cue start |
+| `--exact-frame` | Exact screenshot frame (slower) |
+| `--hwaccel` | `auto` (default), `none`, `d3d11va`, `cuda` |
+| `--workers` | Parallel workers (default min(cpu, 8)) |
+| `--resume` | Resume interrupted build (default true) |
+| `--dry-run` | Plan only, no extraction |
+| `--no-audio` / `--no-screenshot` | Skip media types |
+| `-v, --verbose` | More logging (`-vv` for trace) |
+| `--ffmpeg` | Path to ffmpeg (env: `CONTENT2SRS_FFMPEG`) |
+
+## Bundle format
+
+SQLite `.db` with:
+
+| Table | Contents |
+|-------|----------|
+| `cards` | Text, timestamps, line context, source, audio/image BLOBs |
+| `sources` | Per-episode translation briefings (`id` = video filename) |
+| `deck_summary` | Optional deck-wide default briefing |
+| `assets` | Original subtitle files |
+| `meta` | Build metadata |
+
+Share the `.db` to hand off cards + media. Re-export `.apkg` anytime without re-encoding video.
 
 ## Development
 
@@ -162,7 +180,7 @@ Share the bundle to hand off all card data and media in one file. Re-export `.ap
 cargo test
 ```
 
-Integration tests generate a short `tests/fixtures/sample.mp4` via ffmpeg on first run.
+Integration tests generate `tests/fixtures/sample.mp4` via ffmpeg on first run.
 
 ## License
 

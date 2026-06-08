@@ -19,25 +19,40 @@ pub enum ImageFormat {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "content2srs", about = "Fast subtitle-to-Anki media engine")]
+#[command(
+    name = "content2srs",
+    about = "Fast subtitle-to-Anki media engine",
+    long_about = "Build SQLite deck bundles (.db) from video + subtitles, then export Anki .apkg.\n\
+Supports .srt/.ass, ElevenLabs Scribe .json (Japanese SRS segmentation), season batch mode,\n\
+resumable builds, and episode translation briefings.",
+    version,
+    after_help = "EXAMPLES:\n  \
+        content2srs build -i ep.mkv -s ep.srt -o ep.db\n  \
+        content2srs build -i \"season/*.mkv\" --batch -j 4 --deck-name \"Show\" -o show.db\n  \
+        content2srs summary import -i show.db -f summaries.json\n  \
+        content2srs export -i show.db -o show.apkg --deck-name \"Show\"\n\n\
+Run `content2srs <command> --help` for command-specific options."
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
 
-    #[arg(long, global = true, action = clap::ArgAction::Count)]
+    /// Increase log verbosity (-v, -vv)
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
+    /// Path to ffmpeg binary (ffprobe must be alongside it or on PATH)
     #[arg(long, global = true, env = "CONTENT2SRS_FFMPEG")]
     pub ffmpeg: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Build a deck bundle from video + subtitles
+    /// Extract per-cue audio + screenshots into a SQLite bundle (.db)
     Build(BuildConfig),
-    /// Export an existing bundle to .apkg
+    /// Export a bundle to Anki .apkg (applies episode briefings to Context field)
     Export(ExportConfig),
-    /// Manage episode / deck translation briefings
+    /// Manage episode / deck translation briefings stored in the bundle
     Summary {
         #[command(subcommand)]
         command: SummaryCommand,
@@ -57,7 +72,13 @@ pub enum SummaryCommand {
 }
 
 #[derive(Debug, Parser)]
+#[command(
+    about = "Set an episode briefing for a source (video filename or id)",
+    after_help = "EXAMPLE:\n  content2srs summary set -i show.db -s ep01.mkv \"Briefing text…\"\n  \
+        echo \"Briefing…\" | content2srs summary set -i show.db -s ep01.mkv -"
+)]
 pub struct SetSummaryConfig {
+    /// Bundle (.db) to update
     #[arg(short = 'i', long = "bundle", required = true)]
     pub bundle: PathBuf,
 
@@ -65,6 +86,7 @@ pub struct SetSummaryConfig {
     #[arg(short = 's', long = "source", required = true)]
     pub source: String,
 
+    /// Optional display label for this source
     #[arg(short = 'l', long = "label")]
     pub label: Option<String>,
 
@@ -74,7 +96,12 @@ pub struct SetSummaryConfig {
 }
 
 #[derive(Debug, Parser)]
+#[command(
+    about = "Set a deck-wide default briefing",
+    after_help = "EXAMPLE:\n  content2srs summary set-deck -i show.db \"Show-level briefing…\""
+)]
 pub struct SetDeckSummaryConfig {
+    /// Bundle (.db) to update
     #[arg(short = 'i', long = "bundle", required = true)]
     pub bundle: PathBuf,
 
@@ -84,21 +111,40 @@ pub struct SetDeckSummaryConfig {
 }
 
 #[derive(Debug, Parser)]
+#[command(
+    about = "Import briefings from a JSON file",
+    after_help = "JSON format: { \"deck_summary\": \"…\", \"sources\": { \"ep01.mkv\": \"…\" } }\n\
+EXAMPLE:\n  content2srs summary import -i show.db -f summaries.json"
+)]
 pub struct ImportSummariesConfig {
+    /// Bundle (.db) to update
     #[arg(short = 'i', long = "bundle", required = true)]
     pub bundle: PathBuf,
 
+    /// Summaries JSON file (see tests/fixtures/summaries.example.json)
     #[arg(short = 'f', long = "file", required = true)]
     pub file: PathBuf,
 }
 
 #[derive(Debug, Parser)]
+#[command(about = "List registered sources and briefing status")]
 pub struct ListSummariesConfig {
+    /// Bundle (.db) to inspect
     #[arg(short = 'i', long = "bundle", required = true)]
     pub bundle: PathBuf,
 }
 
 #[derive(Debug, Clone, Parser)]
+#[command(
+    about = "Build a deck bundle from video + subtitles",
+    after_help = "SUBTITLE FORMATS:\n  \
+        .srt / .ass — standard subtitles\n  \
+        .json — ElevenLabs Scribe transcript (use --lang jpn for sentence-level SRS cues)\n\n\
+EXAMPLES:\n  \
+        content2srs build -i ep.mkv -s ep.srt -o ep.db --apkg ep.apkg\n  \
+        content2srs build -i ep.mkv -s transcript.json --lang jpn -o ep.db\n  \
+        content2srs build -i \"season/*.mkv\" --batch -j 4 -o show.db --deck-name \"Show\""
+)]
 pub struct BuildConfig {
     /// Input video/audio file(s); globs supported (e.g. `episodes/*.mkv`)
     #[arg(short = 'i', long = "input", required = true)]
@@ -160,9 +206,11 @@ pub struct BuildConfig {
     #[arg(long = "no-filter")]
     pub no_filter: bool,
 
+    /// Output audio codec for card clips
     #[arg(long, value_enum, default_value_t = AudioFormat::Mp3)]
     pub audio_format: AudioFormat,
 
+    /// Audio bitrate in kbps
     #[arg(long, default_value_t = 128)]
     pub audio_bitrate_kbps: u32,
 
@@ -170,6 +218,7 @@ pub struct BuildConfig {
     #[arg(long)]
     pub loudnorm: bool,
 
+    /// Screenshot image format
     #[arg(long, value_enum, default_value_t = ImageFormat::Jpg)]
     pub image_format: ImageFormat,
 
@@ -215,6 +264,12 @@ pub struct BuildConfig {
 }
 
 #[derive(Debug, Parser)]
+#[command(
+    about = "Export an existing bundle to .apkg",
+    after_help = "Episode briefings in the bundle are composed into each card's Anki Context field.\n\
+Re-run export after `summary import` — no rebuild required.\n\n\
+EXAMPLE:\n  content2srs export -i show.db -o show.apkg --deck-name \"Show\""
+)]
 pub struct ExportConfig {
     /// Bundle (.db) to export
     #[arg(short = 'i', long = "input", required = true)]
@@ -224,6 +279,7 @@ pub struct ExportConfig {
     #[arg(short = 'o', long = "output", required = true)]
     pub output: PathBuf,
 
+    /// Anki deck / note type name
     #[arg(long, default_value = "content2srs")]
     pub deck_name: String,
 }
