@@ -147,7 +147,7 @@ EXAMPLES:\n  \
 )]
 pub struct BuildConfig {
     /// Input video/audio file(s); globs supported (e.g. `episodes/*.mkv`)
-    #[arg(short = 'i', long = "input", required = true)]
+    #[arg(short = 'i', long = "input", required = true, num_args = 1..)]
     pub inputs: Vec<PathBuf>,
 
     /// Batch mode: group inputs into episodes (video + sidecar sub) → one combined deck
