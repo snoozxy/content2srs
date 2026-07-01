@@ -70,6 +70,15 @@ fn prepare_cues(
         cues.retain(|c| filter::is_dialogue(&c.text, regex.as_ref()));
     }
 
+    // Always-on cleanup (independent of --no-filter, which only governs the
+    // stylistic song/sign filter): trim dangling quote brackets left by
+    // mid-quotation segmentation, then drop cues with no language content
+    // (pure punctuation like `？` or `…。`). Both produce broken/empty cards.
+    for cue in cues.iter_mut() {
+        cue.text = filter::normalize_cue_text(&cue.text);
+    }
+    cues.retain(|c| filter::has_linguistic_content(&c.text));
+
     apply_padding(&mut cues, config.padding_ms);
 
     // JSON transcripts are pre-segmented (sentence-level or gap-based); don't re-merge.
@@ -201,6 +210,7 @@ mod tests {
             lang: None,
             padding_ms: 0,
             merge_threshold_ms: 0,
+            max_gap_ms: 400,
             context_lines: 1,
             regex_filter: None,
             no_filter: true,

@@ -11,7 +11,6 @@ use crate::config::BuildConfig;
 use crate::errors::{AppError, Result};
 use crate::subtitles::Cue;
 
-const MERGE_GAP_LIMIT: f64 = 0.4;
 const ANKI_COMMA_TOKEN_LIMIT: usize = 5;
 const SENTENCE_ENDERS: &str = "。！？!?";
 
@@ -107,8 +106,9 @@ pub fn parse(config: &BuildConfig, bytes: &[u8]) -> Result<Vec<Cue>> {
     }
 
     let lang = normalize_lang(&data.language_code, config.lang.as_deref());
+    let max_gap_s = config.max_gap_ms as f64 / 1000.0;
     let raw = if is_japanese(&lang) {
-        parse_japanese_srs(&data)?
+        parse_japanese_srs(&data, max_gap_s)?
     } else {
         parse_gap_based(&data, config.merge_threshold_ms)?
     };
@@ -139,7 +139,7 @@ fn is_japanese(lang: &str) -> bool {
     matches!(lang, "jpn" | "ja" | "japanese")
 }
 
-fn parse_japanese_srs(data: &Transcript) -> Result<Vec<(u64, u64, String)>> {
+fn parse_japanese_srs(data: &Transcript, max_gap_s: f64) -> Result<Vec<(u64, u64, String)>> {
     let mut tagger = JapaneseTagger::new()?;
     let chars = load_chars(data);
     if chars.is_empty() {
@@ -155,7 +155,7 @@ fn parse_japanese_srs(data: &Transcript) -> Result<Vec<(u64, u64, String)>> {
         }
     }
 
-    Ok(bunsetsu_to_anki_cues(&all_bunsetsu))
+    Ok(bunsetsu_to_anki_cues(&all_bunsetsu, max_gap_s))
 }
 
 fn parse_gap_based(data: &Transcript, threshold_ms: u64) -> Result<Vec<(u64, u64, String)>> {
@@ -361,7 +361,7 @@ fn make_bunsetsu(chars: &[CharToken], morphs: &[MorphInfo], speaker: &str) -> Bu
     }
 }
 
-fn bunsetsu_to_anki_cues(bunsetsu_list: &[Bunsetsu]) -> Vec<(u64, u64, String)> {
+fn bunsetsu_to_anki_cues(bunsetsu_list: &[Bunsetsu], max_gap_s: f64) -> Vec<(u64, u64, String)> {
     if bunsetsu_list.is_empty() {
         return Vec::new();
     }
@@ -384,7 +384,7 @@ fn bunsetsu_to_anki_cues(bunsetsu_list: &[Bunsetsu]) -> Vec<(u64, u64, String)> 
         if let Some(last) = current.last() {
             if b.speaker != last.speaker {
                 flush(&mut current);
-            } else if b.start - last.end >= MERGE_GAP_LIMIT {
+            } else if b.start - last.end >= max_gap_s {
                 flush(&mut current);
             }
         }
@@ -467,6 +467,7 @@ mod tests {
             lang: Some("jpn".into()),
             padding_ms: 0,
             merge_threshold_ms: 500,
+            max_gap_ms: 400,
             context_lines: 0,
             regex_filter: None,
             no_filter: true,

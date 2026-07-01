@@ -175,6 +175,7 @@ mod tests {
             lang: None,
             padding_ms: 0,
             merge_threshold_ms: 0,
+            max_gap_ms: 400,
             context_lines: 0,
             regex_filter: None,
             no_filter: true,

@@ -194,6 +194,12 @@ pub struct BuildConfig {
     #[arg(short = 't', long, default_value_t = 0)]
     pub merge_threshold_ms: u64,
 
+    /// Max same-speaker pause (ms) tolerated inside one card for JSON/Japanese SRS
+    /// segmentation. A gap at/above this starts a new card. Larger = fewer, longer
+    /// cards (keeps sentences whole through breaths); smaller = tighter splits.
+    #[arg(long = "max-gap-ms", default_value_t = 400)]
+    pub max_gap_ms: u64,
+
     /// Context lines before/after each card
     #[arg(long, default_value_t = 3)]
     pub context_lines: usize,
