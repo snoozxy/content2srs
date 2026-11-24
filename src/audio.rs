@@ -1,15 +1,34 @@
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
+use std::collections::HashMap;
+use std::path::Path;
 
 use rayon::prelude::*;
+use tempfile::TempDir;
 use tracing::info;
 
 use crate::config::{AudioFormat, BuildConfig};
 use crate::errors::{AppError, Result};
 use crate::ffmpeg::FfmpegTools;
 use crate::pool;
+use crate::util::ms_to_ffmpeg_time;
+
+/// Clips per ffmpeg batch (keeps filter_complex graphs and per-batch decode
+/// windows a reasonable size). Matches frames::FRAME_BATCH in spirit.
+pub const AUDIO_BATCH: usize = 96;
+
+/// Seek this far before the earliest clip so ffmpeg has a nearby sync point.
+const SEEK_MARGIN_MS: u64 = 2_000;
+
+/// Extra decode tail after the last clip window.
+const CAPTURE_TAIL_MS: u64 = 500;
+
+/// Compute input seek position and decode duration for a temporally grouped batch.
+fn batch_seek_range(batch: &[(String, u64, u64)]) -> (u64, u64) {
+    let min_ms = batch.iter().map(|(_, start, _)| *start).min().unwrap_or(0);
+    let max_ms = batch.iter().map(|(_, _, end)| *end).max().unwrap_or(min_ms);
+    let seek_ms = min_ms.saturating_sub(SEEK_MARGIN_MS);
+    let duration_ms = max_ms.saturating_sub(seek_ms) + CAPTURE_TAIL_MS;
+    (seek_ms, duration_ms.max(1))
+}
 
 pub fn extract_audio_clips(
     ffmpeg: &FfmpegTools,
@@ -22,143 +41,151 @@ pub fn extract_audio_clips(
         return Vec::new();
     }
 
+    let mut sorted: Vec<(String, u64, u64)> = ranges.to_vec();
+    sorted.sort_by_key(|(_, start, _)| *start);
+    let batches: Vec<Vec<(String, u64, u64)>> =
+        sorted.chunks(AUDIO_BATCH).map(|c| c.to_vec()).collect();
+
     info!(
-        "extracting {} audio clips with {} workers (per-clip ffmpeg)",
+        "extracting {} audio clips in {} batches (up to {AUDIO_BATCH}/batch, {} workers)",
         ranges.len(),
+        batches.len(),
         config.workers
     );
 
-    let ffmpeg_path = ffmpeg.ffmpeg.clone();
-    let input_path = input.to_path_buf();
-    let format = config.audio_format.clone();
-    let bitrate = config.audio_bitrate_kbps;
-
-    pool::install_pool_with(config.workers, || {
-        ranges
+    let map: HashMap<String, Result<Vec<u8>>> = pool::install_pool_with(config.workers, || {
+        batches
             .par_iter()
-            .map(|(id, start_ms, end_ms)| {
-                let bytes = extract_single_clip(
-                    &ffmpeg_path,
-                    &input_path,
-                    audio_stream_index,
-                    *start_ms,
-                    *end_ms,
-                    &format,
-                    bitrate,
-                );
-                (id.clone(), bytes)
+            .flat_map(|batch| {
+                extract_batch(ffmpeg, input, audio_stream_index, batch, config).unwrap_or_else(
+                    |e| {
+                        batch
+                            .iter()
+                            .map(|(id, _, _)| (id.clone(), Err(e.clone())))
+                            .collect()
+                    },
+                )
             })
             .collect()
-    })
+    });
+
+    ranges
+        .iter()
+        .map(|(id, _, _)| {
+            (
+                id.clone(),
+                map.get(id)
+                    .cloned()
+                    .unwrap_or_else(|| Err(AppError::Ffmpeg("missing audio clip".into()))),
+            )
+        })
+        .collect()
 }
 
-fn extract_single_clip(
-    ffmpeg: &PathBuf,
+/// Extract every clip in `batch` with a single ffmpeg invocation: one input
+/// decode pass feeds an `asplit` fan-out, and each branch is `atrim`'d to its
+/// own clip window. `asplit`/`atrim` (unlike sequential per-output `-ss`) don't
+/// require non-overlapping, monotonically increasing ranges, so overlapping
+/// padded cues (adjacent cues can overlap once `--padding-ms` is applied) are
+/// handled correctly.
+fn extract_batch(
+    ffmpeg: &FfmpegTools,
     input: &Path,
     stream_index: usize,
-    start_ms: u64,
-    end_ms: u64,
-    format: &AudioFormat,
-    bitrate_kbps: u32,
-) -> Result<Vec<u8>> {
-    if end_ms <= start_ms {
-        return Err(AppError::Ffmpeg("invalid audio range".into()));
+    batch: &[(String, u64, u64)],
+    config: &BuildConfig,
+) -> Result<Vec<(String, Result<Vec<u8>>)>> {
+    if batch.is_empty() {
+        return Ok(Vec::new());
     }
 
-    let input_str = input.to_str().unwrap_or_default();
-    let start_s = format!("{:.3}", start_ms as f64 / 1000.0);
-    let dur_s = format!("{:.3}", (end_ms - start_ms) as f64 / 1000.0);
-    let map = format!("0:{stream_index}");
-    let bitrate = format!("{bitrate_kbps}k");
+    // Validate up front so one bad range doesn't take down the whole batch.
+    let mut valid = Vec::with_capacity(batch.len());
+    let mut results = Vec::with_capacity(batch.len());
+    for entry @ (id, start_ms, end_ms) in batch {
+        if end_ms <= start_ms {
+            results.push((
+                id.clone(),
+                Err(AppError::Ffmpeg("invalid audio range".into())),
+            ));
+        } else {
+            valid.push(entry.clone());
+        }
+    }
+    if valid.is_empty() {
+        return Ok(results);
+    }
 
-    let (codec, extra, out_fmt): (&str, &[&str], &str) = match format {
+    let tmp = TempDir::new().map_err(|e| AppError::Ffmpeg(e.to_string()))?;
+    let input_str = input.to_str().unwrap_or_default();
+    let (seek_ms, duration_ms) = batch_seek_range(&valid);
+
+    let n = valid.len();
+    let split_labels: String = (0..n).map(|i| format!("[s{i}]")).collect();
+    let mut filter_parts = vec![format!("[0:{stream_index}]asplit={n}{split_labels}")];
+    for (i, (_, start_ms, end_ms)) in valid.iter().enumerate() {
+        let start_s = *start_ms as f64 / 1000.0;
+        let end_s = *end_ms as f64 / 1000.0;
+        filter_parts.push(format!(
+            "[s{i}]atrim=start={start_s:.3}:end={end_s:.3},asetpts=PTS-STARTPTS[a{i}]"
+        ));
+    }
+    let filter_complex = filter_parts.join(";");
+
+    let bitrate = format!("{}k", config.audio_bitrate_kbps);
+    let (codec, extra, ext): (&str, &[&str], &str) = match config.audio_format {
         AudioFormat::Mp3 => ("libmp3lame", &[], "mp3"),
         AudioFormat::Opus => ("libopus", &["-vbr", "on"], "opus"),
     };
 
     let mut args: Vec<String> = vec![
+        "-y".into(),
         "-v".into(),
         "error".into(),
         "-ss".into(),
-        start_s,
+        ms_to_ffmpeg_time(seek_ms),
+        "-t".into(),
+        ms_to_ffmpeg_time(duration_ms),
+        "-copyts".into(),
         "-i".into(),
         input_str.into(),
-        "-map".into(),
-        map,
-        "-t".into(),
-        dur_s,
-        "-vn".into(),
-        "-c:a".into(),
-        codec.into(),
-        "-b:a".into(),
-        bitrate,
+        "-filter_complex".into(),
+        filter_complex,
     ];
-    for arg in extra {
-        args.push((*arg).into());
+
+    let mut out_paths = Vec::with_capacity(n);
+    for i in 0..n {
+        let out_path = tmp.path().join(format!("clip_{i:04}.{ext}"));
+        args.push("-map".into());
+        args.push(format!("[a{i}]"));
+        args.push("-c:a".into());
+        args.push(codec.into());
+        args.push("-b:a".into());
+        args.push(bitrate.clone());
+        for e in extra {
+            args.push((*e).into());
+        }
+        args.push(out_path.to_str().unwrap_or_default().into());
+        out_paths.push(out_path);
     }
-    args.push("-f".into());
-    args.push(out_fmt.into());
-    args.push("pipe:1".into());
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_ffmpeg_capture(ffmpeg, &arg_refs)
-}
-
-fn run_ffmpeg_capture(ffmpeg: &PathBuf, args: &[&str]) -> Result<Vec<u8>> {
-    let mut child = Command::new(ffmpeg)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    ffmpeg
+        .run(&arg_refs)
         .map_err(|e| AppError::Ffmpeg(e.to_string()))?;
 
-    let stdin = child.stdin.take();
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AppError::Ffmpeg("no ffmpeg stdout".into()))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AppError::Ffmpeg("no ffmpeg stderr".into()))?;
-
-    drop(stdin);
-
-    let stdout_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let stderr_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf);
-        buf
-    });
-
-    let stdout = stdout_handle
-        .join()
-        .map_err(|_| AppError::Ffmpeg("stdout reader thread panicked".into()))?;
-    let status = child.wait().map_err(|e| AppError::Ffmpeg(e.to_string()))?;
-    let stderr = stderr_handle
-        .join()
-        .map_err(|_| AppError::Ffmpeg("stderr reader thread panicked".into()))?;
-
-    if !status.success() {
-        return Err(AppError::Ffmpeg(format!(
-            "ffmpeg failed: {}",
-            String::from_utf8_lossy(&stderr)
-        )));
+    for ((id, _, _), path) in valid.iter().zip(out_paths.iter()) {
+        let bytes = std::fs::read(path).map_err(|e| AppError::Ffmpeg(e.to_string()));
+        results.push((id.clone(), bytes));
     }
-    if stdout.is_empty() {
-        return Err(AppError::Ffmpeg("empty ffmpeg output".into()));
-    }
-    Ok(stdout)
+    Ok(results)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::ImageFormat;
+    use std::path::PathBuf;
     use std::process::Command as ShellCommand;
 
     fn test_config(video: PathBuf) -> BuildConfig {
@@ -246,5 +273,41 @@ mod tests {
             panic!("clip extraction failed: {:?}", results);
         };
         assert!(bytes.len() > 100);
+    }
+
+    #[test]
+    fn batched_clips_extract_independently_including_overlaps() {
+        let video = ensure_sample_video();
+        let ffmpeg = FfmpegTools::discover(None).expect("ffmpeg");
+        // Overlapping ranges (as padding can produce between adjacent cues)
+        // plus out-of-order input, to prove asplit/atrim doesn't need sorted
+        // non-overlapping ranges.
+        let ranges = vec![
+            ("b".to_string(), 3000u64, 4500u64),
+            ("a".to_string(), 1000u64, 2500u64),
+            ("c".to_string(), 4000u64, 5000u64), // overlaps "b"
+        ];
+        let results = extract_audio_clips(&ffmpeg, &video, 1, &ranges, &test_config(video.clone()));
+        assert_eq!(results.len(), 3);
+        for (id, result) in &results {
+            let bytes = result
+                .as_ref()
+                .unwrap_or_else(|e| panic!("clip {id} failed: {e:?}"));
+            assert!(bytes.len() > 100, "clip {id} unexpectedly small");
+        }
+    }
+
+    #[test]
+    fn invalid_range_does_not_fail_whole_batch() {
+        let video = ensure_sample_video();
+        let ffmpeg = FfmpegTools::discover(None).expect("ffmpeg");
+        let ranges = vec![
+            ("good".to_string(), 1000u64, 2500u64),
+            ("bad".to_string(), 5000u64, 4000u64), // end <= start
+        ];
+        let results = extract_audio_clips(&ffmpeg, &video, 1, &ranges, &test_config(video.clone()));
+        let map: HashMap<_, _> = results.into_iter().collect();
+        assert!(map.get("good").unwrap().is_ok());
+        assert!(map.get("bad").unwrap().is_err());
     }
 }

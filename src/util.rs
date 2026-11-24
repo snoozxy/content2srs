@@ -34,22 +34,45 @@ fn ms_to_hms(ms: u64) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
 }
 
+/// Max length for the source stem portion of a media filename. Kept well under
+/// the final 120-char cap in `sanitize_filename` so the per-card id/timestamp
+/// suffix appended after this never gets truncated away, which would collide
+/// distinct cards from the same episode onto the same filename. This is
+/// purely cosmetic (readability) now — uniqueness across episodes is
+/// guaranteed by `batch::episode_prefix` appending a sequential index, not by
+/// anything in this truncation.
+const SOURCE_STEM_MAX_LEN: usize = 60;
+
 pub fn source_stem(source: &str) -> String {
-    Path::new(source)
+    let mut stem = Path::new(source)
         .file_stem()
         .and_then(|s| s.to_str())
         .map(sanitize_filename)
-        .unwrap_or_else(|| "clip".into())
+        .unwrap_or_else(|| "clip".into());
+    if stem.len() > SOURCE_STEM_MAX_LEN {
+        stem.truncate(SOURCE_STEM_MAX_LEN);
+    }
+    stem
 }
 
-/// Card id prefixed with the source video stem when not already present (batch mode).
+/// Card id prefixed with the source video stem when not already present.
+///
+/// In batch mode, `card_id` already begins with the episode's globally
+/// unique prefix (see `batch::episode_prefix`, assigned by sequential index)
+/// — bare `card_id`s only look like `"card_00042"` in single-file mode where
+/// no episode prefix has been assigned yet. Distinguishing on that shape
+/// (rather than re-deriving `source_stem` here and string-matching it
+/// against `card_id`) avoids a bug where this function's truncation could
+/// disagree with the one that produced `card_id`, causing the stem to be
+/// prepended a second time instead of recognized as already present.
 fn media_id_part(source: &str, card_id: &str) -> String {
-    let stem = source_stem(source);
-    if card_id.starts_with(&format!("{stem}_")) {
-        card_id.to_string()
-    } else {
-        format!("{stem}_{card_id}")
+    if !card_id.starts_with("card_") {
+        // Already carries a batch-assigned episode prefix.
+        return card_id.to_string();
     }
+    // Single-file mode: card_id is a bare "card_NNNNN" with no episode
+    // context — prepend the source stem for a readable filename.
+    format!("{}_{card_id}", source_stem(source))
 }
 
 pub fn media_filename(source: &str, card_id: &str, start_ms: u64, end_ms: u64, ext: &str) -> String {

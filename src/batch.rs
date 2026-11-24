@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::errors::{AppError, Result};
-use crate::util::sanitize_filename;
+use crate::util::source_stem;
 
 const VIDEO_EXTENSIONS: &[&str] = &["mkv", "mp4", "webm", "avi", "mov", "m4v", "ts"];
 const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "ass", "ssa", "vtt", "json"];
@@ -85,20 +85,41 @@ pub fn discover_episodes(paths: &[PathBuf]) -> Result<Vec<Episode>> {
         ));
     }
 
-    let mut episodes: Vec<Episode> = videos
+    let mut episodes: Vec<(String, Episode)> = videos
         .into_iter()
-        .map(|(key, video)| Episode {
-            prefix: episode_prefix(&key),
-            subtitle: subtitles.remove(&key),
-            video,
+        .map(|(key, video)| {
+            let subtitle = subtitles.remove(&key);
+            (
+                key,
+                Episode {
+                    prefix: String::new(),
+                    subtitle,
+                    video,
+                },
+            )
         })
         .collect();
-    episodes.sort_by(|a, b| a.video.cmp(&b.video));
-    Ok(episodes)
-}
+    episodes.sort_by(|a, b| a.1.video.cmp(&b.1.video));
 
-pub fn episode_prefix(stem: &str) -> String {
-    sanitize_filename(stem)
+    // Assign the card-id prefix by sequential position (in final sort order)
+    // rather than from the source filename alone: release-group filenames in
+    // a batch commonly share a long common prefix (group tag, show title)
+    // with the differentiating part (episode number) appearing only near the
+    // end, e.g. "[Group] Show Title Here - S01E01 - ..." vs "...S01E02 -
+    // ...". A fixed-length truncation of that string can land before the
+    // episode number, making every episode in the batch collide onto the
+    // identical stem — and since the stem seeds each card's id (primary
+    // key), later episodes silently overwrite earlier ones' rows. A
+    // sequential index guarantees uniqueness regardless of naming.
+    let episodes: Vec<Episode> = episodes
+        .into_iter()
+        .enumerate()
+        .map(|(i, (key, mut ep))| {
+            ep.prefix = format!("{}_ep{:03}", source_stem(&key), i + 1);
+            ep
+        })
+        .collect();
+    Ok(episodes)
 }
 
 fn grouping_key(path: &Path) -> String {
@@ -176,7 +197,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(episodes.len(), 2);
-        assert_eq!(episodes[0].prefix, "ep01");
+        assert_eq!(episodes[0].prefix, "ep01_ep001");
         assert_eq!(episodes[0].subtitle.as_deref(), Some(Path::new("ep01.srt")));
         assert_eq!(episodes[1].subtitle.as_deref(), Some(Path::new("ep02.ass")));
     }
